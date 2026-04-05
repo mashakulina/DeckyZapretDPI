@@ -1,0 +1,11 @@
+{
+  "name": "Zapret DPI",
+  "author": "DeckyZapretDPI",
+  "version": "1.0.0",
+  "flags": ["root"],
+  "publish": {
+    "tags": ["network", "utility", "root"],
+    "description": "Start/stop Zapret DPI service and show status from Zapret DPI Manager.",
+    "image": ""
+  }
+}
