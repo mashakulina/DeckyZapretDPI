@@ -841,6 +841,146 @@
     return e(F.PanelSection, null, miRows);
   }
 
+  function ZapretServiceInstallHome(propz) {
+    var ru = propz.ru;
+    var onInstalled = propz.onInstalled;
+    var bs = useState(false);
+    var busy = bs[0];
+    var setBusy = bs[1];
+    var det = useState(null);
+    var lastDetail = det[0];
+    var setLastDetail = det[1];
+    var pollRef = useRef(null);
+
+    useEffect(function () {
+      return function () {
+        if (pollRef.current != null) clearInterval(pollRef.current);
+      };
+    }, []);
+
+    function clearPoll() {
+      if (pollRef.current != null) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    }
+
+    function startPolling() {
+      clearPoll();
+      var n = 0;
+      pollRef.current = setInterval(function () {
+        n += 1;
+        if (n > 90) {
+          clearPoll();
+          return;
+        }
+        api
+          .callPluginMethod("get_zapret_state", {})
+          .then(function (r) {
+            if (r.success && r.result && r.result.zapret_service_installed === true) {
+              clearPoll();
+              onInstalled();
+            }
+          })
+          .catch(function () {});
+      }, 4000);
+    }
+
+    function runInstall() {
+      setBusy(true);
+      setLastDetail(null);
+      api
+        .callPluginMethod("install_zapret_service", {})
+        .then(function (r) {
+          if (r.success && r.result) {
+            var st = r.result.status;
+            if (st === "already_installed") {
+              api.toaster.toast({
+                title: "Zapret DPI",
+                body: ru ? "Служба Zapret уже установлена." : "Zapret service is already installed.",
+              });
+              onInstalled();
+            } else if (st === "started") {
+              api.toaster.toast({
+                title: "Zapret DPI",
+                body: ru
+                  ? "Установка службы запущена в фоне. Подождите. Лог: /tmp/deckyzapretdpi_zapret_install.log (режим рабочего стола)."
+                  : "Service install started in the background. Wait. Log: /tmp/deckyzapretdpi_zapret_install.log (Desktop mode).",
+              });
+              startPolling();
+            } else {
+              var d = r.result.detail || "error";
+              setLastDetail(d);
+              return api.callPluginMethod("get_zapret_service_install_log_tail", {}).then(function (lr) {
+                if (lr.success && lr.result && lr.result.tail && lr.result.tail.trim()) {
+                  setLastDetail(d + "\n---\n" + lr.result.tail);
+                }
+              });
+            }
+          } else {
+            setLastDetail(ru ? "Вызов установки не удался" : "Install call failed");
+          }
+        })
+        .catch(function (e) {
+          setLastDetail(String(e));
+        })
+        .finally(function () {
+          setBusy(false);
+        });
+    }
+
+    var panelBodyZs = {
+      display: "block",
+      width: "100%",
+      margin: 0,
+      padding: 0,
+      textIndent: 0,
+      boxSizing: "border-box",
+    };
+
+    var zsRows = [
+      e(F.PanelSectionRow, null,
+        e(
+          "span",
+          { style: Object.assign({}, panelBodyZs, { fontSize: 12, opacity: 0.9, whiteSpace: "pre-wrap" }) },
+          ru
+            ? "Служба Zapret не установлена: нужны каталог /opt/zapret и файл /usr/lib/systemd/system/zapret.service. Установите кнопкой ниже или через Zapret DPI Manager на рабочем столе."
+            : "Zapret service is missing: need /opt/zapret and /usr/lib/systemd/system/zapret.service. Install with the button below or use Zapret DPI Manager on the desktop.",
+        ),
+      ),
+      e(F.PanelSectionRow, null,
+        e(F.ButtonItem, { layout: "below", disabled: busy, onClick: runInstall },
+          busy
+            ? ru
+              ? "Запуск…"
+              : "Starting…"
+            : ru
+              ? "Установить службу Zapret DPI"
+              : "Install Zapret DPI service",
+        ),
+      ),
+    ];
+    if (lastDetail) {
+      zsRows.push(
+        e(F.PanelSectionRow, null,
+          e(
+            "span",
+            {
+              style: Object.assign({}, panelBodyZs, {
+                marginTop: 12,
+                fontSize: 11,
+                color: "#e57373",
+                whiteSpace: "pre-wrap",
+              }),
+            },
+            lastDetail,
+          ),
+        ),
+      );
+    }
+    return e(F.PanelSection, null, zsRows);
+  }
+
   function SettingsPageRouter(props) {
     var ru = ruLang();
     var serverAPI = props.serverAPI;
@@ -906,6 +1046,7 @@
             strategy_detail: "",
             manager_path: "",
             manager_installed: false,
+            zapret_service_installed: false,
             working_strategies: [],
             gamefilter_enabled: false,
             game_preset_id: null,
@@ -1080,6 +1221,15 @@
 
     if (state.manager_installed !== true) {
       return e(ManagerInstallHome, {
+        ru: ru,
+        onInstalled: function () {
+          refresh();
+        },
+      });
+    }
+
+    if (state.zapret_service_installed !== true) {
+      return e(ZapretServiceInstallHome, {
         ru: ru,
         onInstalled: function () {
           refresh();

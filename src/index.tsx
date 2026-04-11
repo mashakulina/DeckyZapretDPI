@@ -35,6 +35,7 @@ export type ZapretState = {
   strategy_detail: string;
   manager_path: string;
   manager_installed?: boolean;
+  zapret_service_installed?: boolean;
   working_strategies: string[];
   apply_ok?: boolean;
   apply_message?: string;
@@ -264,6 +265,112 @@ function ManagerInstallHome({ ru, onInstalled }: { ru: boolean; onInstalled: () 
   );
 }
 
+/** Экран установки службы zapret (аналог ManagerInstallHome), пока нет /opt/zapret и unit-файла. */
+function ZapretServiceInstallHome({ ru, onInstalled }: { ru: boolean; onInstalled: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [lastDetail, setLastDetail] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const clearPoll = useCallback(() => {
+    if (pollRef.current != null) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => () => clearPoll(), [clearPoll]);
+
+  const startPolling = useCallback(() => {
+    clearPoll();
+    let n = 0;
+    pollRef.current = setInterval(() => {
+      n += 1;
+      if (n > 90) {
+        clearPoll();
+        return;
+      }
+      void api
+        .callPluginMethod<{}, ZapretState>("get_zapret_state", {})
+        .then((r) => {
+          if (r.success && r.result?.zapret_service_installed === true) {
+            clearPoll();
+            onInstalled();
+          }
+        })
+        .catch(() => {});
+    }, 4000);
+  }, [clearPoll, onInstalled]);
+
+  const runInstall = async () => {
+    setBusy(true);
+    setLastDetail(null);
+    try {
+      const r = await api.callPluginMethod<{}, ManagerInstallResult>("install_zapret_service", {});
+      if (r.success && r.result) {
+        const st = r.result.status;
+        if (st === "already_installed") {
+          api.toaster.toast({
+            title: "Zapret DPI",
+            body: ru ? "Служба Zapret уже установлена." : "Zapret service is already installed.",
+          });
+          onInstalled();
+        } else if (st === "started") {
+          api.toaster.toast({
+            title: "Zapret DPI",
+            body: ru
+              ? "Установка службы запущена в фоне. Подождите. Лог: /tmp/deckyzapretdpi_zapret_install.log (режим рабочего стола)."
+              : "Service install started in the background. Wait. Log: /tmp/deckyzapretdpi_zapret_install.log (Desktop mode).",
+          });
+          startPolling();
+        } else {
+          const d = r.result.detail || "error";
+          setLastDetail(d);
+          const lr = await api.callPluginMethod<{}, LogTailResult>("get_zapret_service_install_log_tail", {});
+          if (lr.success && lr.result?.tail?.trim()) {
+            setLastDetail(`${d}\n---\n${lr.result.tail}`);
+          }
+        }
+      } else {
+        setLastDetail(ru ? "Вызов установки не удался" : "Install call failed");
+      }
+    } catch (e) {
+      setLastDetail(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <PanelSection>
+      <PanelSectionRow>
+        <span style={{ ...panelBodyNoIndent, fontSize: 12, opacity: 0.9, whiteSpace: "pre-wrap" }}>
+          {ru
+            ? "Служба Zapret не установлена: нужны каталог /opt/zapret и файл /usr/lib/systemd/system/zapret.service. Установите кнопкой ниже или через Zapret DPI Manager на рабочем столе."
+            : "Zapret service is missing: need /opt/zapret and /usr/lib/systemd/system/zapret.service. Install with the button below or use Zapret DPI Manager on the desktop."}
+        </span>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy} onClick={() => void runInstall()}>
+          {busy
+            ? ru
+              ? "Запуск…"
+              : "Starting…"
+            : ru
+              ? "Установить службу Zapret DPI"
+              : "Install Zapret DPI service"}
+        </ButtonItem>
+      </PanelSectionRow>
+      {lastDetail ? (
+        <PanelSectionRow>
+          <span style={{ ...panelBodyNoIndent, marginTop: 12, fontSize: 11, color: "#e57373", whiteSpace: "pre-wrap" }}>
+            {lastDetail}
+          </span>
+        </PanelSectionRow>
+      ) : null}
+    </PanelSection>
+  );
+}
+
 const Content = () => {
   const ru = navigator.language?.toLowerCase().startsWith("ru");
   const [state, setState] = useState<ZapretState | null>(null);
@@ -283,6 +390,8 @@ const Content = () => {
         strategy_label: ru ? "Не удалось прочитать состояние" : "Could not read state",
         strategy_detail: "",
         manager_path: "",
+        manager_installed: false,
+        zapret_service_installed: false,
         working_strategies: [],
         gamefilter_enabled: false,
         game_preset_id: null,
@@ -423,6 +532,10 @@ const Content = () => {
 
   if (state.manager_installed !== true) {
     return <ManagerInstallHome ru={ru} onInstalled={() => void refresh()} />;
+  }
+
+  if (state.zapret_service_installed !== true) {
+    return <ZapretServiceInstallHome ru={ru} onInstalled={() => void refresh()} />;
   }
 
   return (

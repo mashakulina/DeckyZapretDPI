@@ -74,6 +74,15 @@ def _manager_installed() -> bool:
     return main_py.is_file() and presets.is_file()
 
 
+_ZAPRET_OPT = pathlib.Path("/opt/zapret")
+_ZAPRET_SYSTEMD_UNIT = pathlib.Path("/usr/lib/systemd/system/zapret.service")
+
+
+def _zapret_service_installed() -> bool:
+    """Служба zapret: каталог /opt/zapret и unit-файл (как в core/zapret_checker.is_zapret_installed)."""
+    return _ZAPRET_OPT.is_dir() and _ZAPRET_SYSTEMD_UNIT.is_file()
+
+
 # Загружаем decky_autopicker по пути рядом с main.py: в песочнице Decky sys.path может не содержать каталог плагина.
 _autopicker: Any = None
 _autopicker_load_error: Optional[str] = None
@@ -491,6 +500,7 @@ def _collect_state() -> dict:
         "strategy_detail": _read_strategy_detail(manager),
         "manager_path": str(manager),
         "manager_installed": _manager_installed(),
+        "zapret_service_installed": _zapret_service_installed(),
         "working_strategies": _read_working_strategy_names(manager),
         "gamefilter_enabled": gf_on,
         "game_preset_id": gf_pid,
@@ -644,11 +654,168 @@ echo "== finished $(date)"
         return {"status": "error", "detail": str(e), "log_path": log_path}
 
 
+# --- Установка службы Zapret (/opt/zapret + systemd), как в ZapretChecker без GUI ---
+_ZAPRET_SVC_ARCHIVE_URL = (
+    "https://github.com/mashakulina/Zapret-DPI-for-Steam-Deck/releases/latest/download/zapret.tar.gz"
+)
+_ZAPRET_SVC_INSTALL_WORK = pathlib.Path("/tmp/deckyzapretdpi_zapret_install")
+_ZAPRET_SVC_INSTALL_LOG = pathlib.Path("/tmp/deckyzapretdpi_zapret_install.log")
+_ZAPRET_SVC_INSTALL_RUNNER = pathlib.Path("/tmp/deckyzapretdpi_zapret_install_run.sh")
+_ZAPRET_SVC_INSTALL_UNIT = "deckyzapretdpi-zapret-install"
+
+
+def _read_zapret_service_install_log_tail(max_chars: int = 2400) -> str:
+    if not _ZAPRET_SVC_INSTALL_LOG.is_file():
+        return ""
+    try:
+        raw = _ZAPRET_SVC_INSTALL_LOG.read_text(encoding="utf-8", errors="replace")
+        if len(raw) <= max_chars:
+            return raw
+        return raw[-max_chars:]
+    except OSError:
+        return ""
+
+
+def _install_zapret_service_thread() -> dict:
+    """Фоновая установка zapret через systemd-run (root), по шагам как core/zapret_checker.install_zapret."""
+    log_path = str(_ZAPRET_SVC_INSTALL_LOG)
+    if _zapret_service_installed():
+        return {"status": "already_installed", "detail": None, "log_path": log_path}
+    if not _manager_installed():
+        return {
+            "status": "error",
+            "detail": "Сначала установите Zapret DPI Manager",
+            "log_path": log_path,
+        }
+    try:
+        if _ZAPRET_SVC_INSTALL_WORK.is_dir():
+            shutil.rmtree(_ZAPRET_SVC_INSTALL_WORK, ignore_errors=True)
+        _ZAPRET_SVC_INSTALL_WORK.mkdir(parents=True, exist_ok=True)
+        work_q = shlex.quote(str(_ZAPRET_SVC_INSTALL_WORK.resolve()))
+        log_q = shlex.quote(str(_ZAPRET_SVC_INSTALL_LOG.resolve()))
+        url_q = shlex.quote(_ZAPRET_SVC_ARCHIVE_URL)
+        unit_body = r"""[Unit]
+Description=zapret
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/zapret
+ExecStart=/bin/bash /opt/zapret/starter.sh
+ExecStop=/bin/bash /opt/zapret/stopper.sh
+
+[Install]
+WantedBy=multi-user.target
+"""
+        # Скрипт выполняется под root (systemd-run / sudo systemd-run)
+        script = (
+            f"""#!/bin/bash
+set +e
+exec > >(tee -a {log_q}) 2>&1
+echo "== DeckyZapret: install zapret service $(date)"
+if command -v steamos-readonly >/dev/null 2>&1; then
+  steamos-readonly disable || true
+fi
+rm -rf {work_q}
+mkdir -p {work_q}
+cd {work_q} || exit 1
+curl -fSL -o zapret.tar.gz {url_q} || exit 1
+tar -xzf zapret.tar.gz || exit 1
+SYSTEM_DIR=$(find . -type d -name system | head -n 1)
+BINS_DIR=$(find . -type d -name bins | head -n 1)
+if [[ -z "$SYSTEM_DIR" || ! -d "$SYSTEM_DIR" ]]; then
+  echo "ERROR: system dir not found in archive"
+  exit 1
+fi
+mkdir -p /opt/zapret
+cp -a "$SYSTEM_DIR"/. /opt/zapret/ || exit 1
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64) BARCH=x86_64 ;;
+  aarch64) BARCH=arm64 ;;
+  armv7l|armv6l) BARCH=arm ;;
+  i386|i686) BARCH=x86 ;;
+  *) BARCH=x86_64 ;;
+esac
+if [[ -n "$BINS_DIR" && -d "$BINS_DIR/$BARCH" ]]; then
+  NFQWS="$BINS_DIR/$BARCH/nfqws"
+  if [[ -f "$NFQWS" ]]; then
+    cp -f "$NFQWS" /opt/zapret/nfqws
+    chmod +x /opt/zapret/nfqws
+  fi
+fi
+echo iptables > /opt/zapret/FWTYPE
+chmod -R o+r /opt/zapret/ 2>/dev/null || true
+cat > /tmp/zapret.service.deckyzapretdpi <<'EOFUNIT'
+"""
+            + f"{unit_body.rstrip()}\n"
+            + """EOFUNIT
+cp /tmp/zapret.service.deckyzapretdpi /usr/lib/systemd/system/zapret.service
+chmod 644 /usr/lib/systemd/system/zapret.service
+systemctl daemon-reload || exit 1
+systemctl enable zapret.service 2>/dev/null || true
+systemctl start zapret.service 2>/dev/null || true
+if command -v steamos-readonly >/dev/null 2>&1; then
+  steamos-readonly enable || true
+fi
+echo "== finished $(date)"
+"""
+        )
+        _ZAPRET_SVC_INSTALL_RUNNER.write_text(script, encoding="utf-8")
+        _ZAPRET_SVC_INSTALL_RUNNER.chmod(0o755)
+        try:
+            _ZAPRET_SVC_INSTALL_LOG.write_text("", encoding="utf-8")
+        except OSError:
+            pass
+        r2 = subprocess.run(
+            [
+                "systemd-run",
+                "--unit",
+                _ZAPRET_SVC_INSTALL_UNIT,
+                "--service-type=oneshot",
+                "--quiet",
+                str(_ZAPRET_SVC_INSTALL_RUNNER),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_clean_env(),
+        )
+        if r2.returncode != 0:
+            sr = subprocess.run(
+                [
+                    "sudo",
+                    "systemd-run",
+                    "--unit",
+                    f"{_ZAPRET_SVC_INSTALL_UNIT}_sudo",
+                    "--service-type=oneshot",
+                    "--quiet",
+                    str(_ZAPRET_SVC_INSTALL_RUNNER),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=_clean_env(),
+            )
+            if sr.returncode != 0:
+                tail = (sr.stdout or sr.stderr or r2.stdout or r2.stderr or "")[:400]
+                return {
+                    "status": "error",
+                    "detail": tail or "systemd-run failed",
+                    "log_path": log_path,
+                }
+        return {"status": "started", "detail": None, "log_path": log_path}
+    except Exception as e:
+        return {"status": "error", "detail": str(e), "log_path": log_path}
+
+
 def _get_manager_install_state_thread() -> dict:
     ok = _manager_installed()
     if ok and _game_presets is None:
         _load_game_presets()
-    return {"manager_installed": ok}
+    return {"manager_installed": ok, "zapret_service_installed": _zapret_service_installed()}
 
 
 # --- Plugin self-update (DeckyWARP-style: GitHub releases/latest, systemd-run + bash) ---
@@ -921,6 +1088,11 @@ class Plugin:
 
     async def toggle_zapret(self) -> dict:
         def _toggle():
+            if not _zapret_service_installed():
+                out = _collect_state()
+                out["toggle_ok"] = False
+                out["toggle_message"] = "zapret_service_missing"
+                return out
             st = _service_state()
             if st == "active":
                 _run_systemctl("stop", "zapret")
@@ -1054,8 +1226,14 @@ class Plugin:
     async def install_zapret_dpi_manager(self) -> dict:
         return await asyncio.to_thread(_install_zapret_dpi_manager_thread)
 
+    async def install_zapret_service(self) -> dict:
+        return await asyncio.to_thread(_install_zapret_service_thread)
+
     async def get_manager_install_log_tail(self) -> dict:
         return await asyncio.to_thread(lambda: {"tail": _read_manager_install_log_tail()})
+
+    async def get_zapret_service_install_log_tail(self) -> dict:
+        return await asyncio.to_thread(lambda: {"tail": _read_zapret_service_install_log_tail()})
 
 
 plugin = Plugin()
