@@ -29,3 +29,16 @@ bash <(curl -s https://raw.githubusercontent.com/mashakulina/DeckyZapretDPI/main
 ```
 
 Удаляется только плагин; **Zapret DPI Manager** и сам обход на консоли не трогаются.
+
+# Screenshots/Скриншоты
+![screenshot](https://i.ibb.co/KpFHBD9z/20260411-141011-1.png)
+![screenshot](https://i.ibb.co/67bFNNkZ/20260411-140628.png)
+![screenshot](https://i.ibb.co/fYvMC3Fm/20260411-142613.png)
+![screenshot](https://i.ibb.co/jkS4jHQJ/20260411-140646.png)
+![screenshot](https://i.ibb.co/6RfGwTnW/20260411-140712.png)
+![screenshot](https://i.ibb.co/gZJMRQzx/20260411-140726.png)
+![screenshot](https://i.ibb.co/WNjkNb0K/20260411-140734.png)
+![screenshot](https://i.ibb.co/M5QNPNKs/20260411-141052.png)
+![screenshot](https://i.ibb.co/23Y8Wyd9/20260411-141129.png)
+![screenshot](https://i.ibb.co/1YbT3cbC/20260411-141153.png)
+![screenshot](https://i.ibb.co/ynk4CB9H/20260411-141205.png)
