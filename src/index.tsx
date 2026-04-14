@@ -382,7 +382,9 @@ const Content = () => {
 
   const refresh = async () => {
     try {
-      setState(await get_zapret_state());
+      const [nextState, presetsRes] = await Promise.all([get_zapret_state(), list_game_presets()]);
+      setState(nextState);
+      setGamePresets(presetsRes.presets ?? []);
     } catch {
       setState({
         service: "unknown",
@@ -406,12 +408,6 @@ const Content = () => {
     refresh();
     const id = setInterval(refresh, 3000);
     return () => clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    list_game_presets()
-      .then((r) => setGamePresets(r.presets ?? []))
-      .catch(() => setGamePresets([]));
   }, []);
 
   const active = state?.service === "active";

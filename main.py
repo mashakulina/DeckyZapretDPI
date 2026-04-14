@@ -113,6 +113,7 @@ _load_decky_autopicker()
 
 _game_presets: Any = None
 _game_presets_load_error: Optional[str] = None
+_game_presets_mtime: Optional[float] = None
 _DECKY_GAME_PRESETS_MOD = "decky_game_presets"
 
 
@@ -127,9 +128,10 @@ def _ensure_manager_syspath_for_presets() -> None:
 
 
 def _load_game_presets() -> None:
-    global _game_presets, _game_presets_load_error
+    global _game_presets, _game_presets_load_error, _game_presets_mtime
     _game_presets = None
     _game_presets_load_error = None
+    _game_presets_mtime = None
     mod_path = _MANAGER_ROOT / "core" / "game_presets.py"
     if not mod_path.is_file():
         _game_presets_load_error = f"Файл не найден: {mod_path}"
@@ -145,6 +147,10 @@ def _load_game_presets() -> None:
         sys.modules[_DECKY_GAME_PRESETS_MOD] = mod
         spec.loader.exec_module(mod)
         _game_presets = mod
+        try:
+            _game_presets_mtime = mod_path.stat().st_mtime
+        except OSError:
+            _game_presets_mtime = None
     except Exception as e:
         _game_presets_load_error = f"{type(e).__name__}: {e}"
         _game_presets = None
@@ -152,9 +158,17 @@ def _load_game_presets() -> None:
 
 def _maybe_reload_game_presets() -> None:
     """Повторная загрузка после появления менеджера (при старте плагина файла ещё не было или импорт упал)."""
-    if not _manager_installed():
+    manager_ok = _manager_installed()
+    mod_path = _MANAGER_ROOT / "core" / "game_presets.py"
+    current_mtime: Optional[float] = None
+    try:
+        current_mtime = mod_path.stat().st_mtime
+    except OSError:
+        current_mtime = None
+    if not manager_ok:
         return
-    if _game_presets is not None:
+    needs_reload = (_game_presets is None) or (_game_presets_mtime != current_mtime)
+    if not needs_reload:
         return
     _load_game_presets()
 
