@@ -1,7 +1,7 @@
 {
   "name": "Zapret DPI",
   "author": "Mels Kappi",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "flags": ["root"],
   "publish": {
     "tags": ["network", "utility", "root"],
