@@ -944,8 +944,8 @@
           "span",
           { style: Object.assign({}, panelBodyZs, { fontSize: 12, opacity: 0.9, whiteSpace: "pre-wrap" }) },
           ru
-            ? "Служба Zapret не установлена: нужны каталог /opt/zapret и файл /usr/lib/systemd/system/zapret.service. Установите кнопкой ниже или через Zapret DPI Manager на рабочем столе."
-            : "Zapret service is missing: need /opt/zapret and /usr/lib/systemd/system/zapret.service. Install with the button below or use Zapret DPI Manager on the desktop.",
+            ? "Служба Zapret не установлена. Установите кнопкой ниже или через Zapret DPI Manager на рабочем столе."
+            : "Zapret service is not installed. Install with the button below or use Zapret DPI Manager on the desktop.",
         ),
       ),
       e(F.PanelSectionRow, null,

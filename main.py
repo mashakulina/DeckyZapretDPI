@@ -75,12 +75,16 @@ def _manager_installed() -> bool:
 
 
 _ZAPRET_OPT = pathlib.Path("/opt/zapret")
-_ZAPRET_SYSTEMD_UNIT = pathlib.Path("/usr/lib/systemd/system/zapret.service")
+# Как в Zapret DPI Manager: unit в /etc (immutable-/usr, обновлённый SteamOS); legacy — старые установки.
+_ZAPRET_SYSTEMD_UNIT = pathlib.Path("/etc/systemd/system/zapret.service")
+_ZAPRET_SYSTEMD_UNIT_LEGACY = pathlib.Path("/usr/lib/systemd/system/zapret.service")
 
 
 def _zapret_service_installed() -> bool:
-    """Служба zapret: каталог /opt/zapret и unit-файл (как в core/zapret_checker.is_zapret_installed)."""
-    return _ZAPRET_OPT.is_dir() and _ZAPRET_SYSTEMD_UNIT.is_file()
+    """Служба zapret: /opt/zapret и unit в /etc или в legacy /usr (старые установки / до синхронизации с менеджером)."""
+    if not _ZAPRET_OPT.is_dir():
+        return False
+    return _ZAPRET_SYSTEMD_UNIT.is_file() or _ZAPRET_SYSTEMD_UNIT_LEGACY.is_file()
 
 
 # Загружаем decky_autopicker по пути рядом с main.py: в песочнице Decky sys.path может не содержать каталог плагина.
@@ -766,8 +770,10 @@ cat > /tmp/zapret.service.deckyzapretdpi <<'EOFUNIT'
 """
             + f"{unit_body.rstrip()}\n"
             + """EOFUNIT
-cp /tmp/zapret.service.deckyzapretdpi /usr/lib/systemd/system/zapret.service
-chmod 644 /usr/lib/systemd/system/zapret.service
+mkdir -p /etc/systemd/system
+cp /tmp/zapret.service.deckyzapretdpi /etc/systemd/system/zapret.service
+chmod 644 /etc/systemd/system/zapret.service
+rm -f /usr/lib/systemd/system/zapret.service 2>/dev/null || true
 systemctl daemon-reload || exit 1
 systemctl enable zapret.service 2>/dev/null || true
 systemctl start zapret.service 2>/dev/null || true
