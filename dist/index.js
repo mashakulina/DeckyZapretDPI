@@ -43,6 +43,11 @@
   }
 
   var NONE_PRESET = "none";
+  var FALL_GUYS_PRESET_ID = "fall_guys";
+  var FALL_GUYS_PRESET_INFO_RU =
+    "Данный пресет применяется для игры из Epic Games Store. Для игры из Steam в настройках игры смените регион на США (восток).";
+  var FALL_GUYS_PRESET_INFO_EN =
+    "This preset applies to the Epic Games Store version. For the Steam version, set the in-game region to USA (East).";
 
   function serviceStatusText(ru, active) {
     var ruMap = {
@@ -1185,6 +1190,31 @@
         });
     }
 
+    function openFallGuysPresetInfoModal() {
+      var title = ru ? "Пресет Fall Guys" : "Fall Guys preset";
+      var modal;
+      modal = F.showModal(
+        e(F.ConfirmModal, {
+          bAlertDialog: true,
+          strTitle: title,
+          strDescription: ru ? FALL_GUYS_PRESET_INFO_RU : FALL_GUYS_PRESET_INFO_EN,
+          strOKButtonText: ru ? "Понятно" : "OK",
+          onOK: function () {
+            modal.Close();
+          },
+          closeModal: function () {
+            modal.Close();
+          },
+        }),
+        undefined,
+        {
+          strTitle: title,
+          popupWidth: 440,
+          popupHeight: 260,
+        },
+      );
+    }
+
     function openGameFilterEnableModal() {
       var warnRu =
         "Фильтр GameFilter — экспериментальная функция. Возможны чёрный экран при переходе в игровой режим, долгая загрузка, проблемы с YouTube и Discord и другие нестабильности. Пользуйтесь на свой страх и риск.";
@@ -1447,8 +1477,13 @@
             if (raw == null) return;
             var preset_id = raw === NONE_PRESET ? null : raw;
             setGfBusy(true);
+            if (preset_id === FALL_GUYS_PRESET_ID) {
+              openFallGuysPresetInfoModal();
+            }
             set_game_preset(preset_id)
-              .then(setState)
+              .then(function (next) {
+                setState(next);
+              })
               .catch(function () {
                 setState(function (prev) {
                   if (!prev) return prev;

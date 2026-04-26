@@ -152,6 +152,35 @@ function ipsetErrorText(ru: boolean, code: string): string {
 
 const NONE_PRESET = "none";
 
+/** Совпадает с preset_id в game_presets.py менеджера; текст окна только в плагине. */
+const FALL_GUYS_PRESET_ID = "fall_guys";
+
+const FALL_GUYS_PRESET_INFO_RU =
+  "Данный пресет применяется для игры из Epic Games Store. Для игры из Steam в настройках игры смените регион на США (восток).";
+const FALL_GUYS_PRESET_INFO_EN =
+  "This preset applies to the Epic Games Store version. For the Steam version, set the in-game region to USA (East).";
+
+function openFallGuysPresetInfoModal(ru: boolean) {
+  const title = ru ? "Пресет Fall Guys" : "Fall Guys preset";
+  let modal: ReturnType<typeof showModal>;
+  modal = showModal(
+    <ConfirmModal
+      bAlertDialog
+      strTitle={title}
+      strDescription={ru ? FALL_GUYS_PRESET_INFO_RU : FALL_GUYS_PRESET_INFO_EN}
+      strOKButtonText={ru ? "Понятно" : "OK"}
+      onOK={() => modal.Close()}
+      closeModal={() => modal.Close()}
+    />,
+    undefined,
+    {
+      strTitle: title,
+      popupWidth: 440,
+      popupHeight: 260,
+    },
+  );
+}
+
 type ManagerInstallResult = {
   status: string;
   detail?: string | null;
@@ -677,6 +706,9 @@ const Content = () => {
             const preset_id = raw === NONE_PRESET ? null : raw;
             setGfBusy(true);
             try {
+              if (preset_id === FALL_GUYS_PRESET_ID) {
+                openFallGuysPresetInfoModal(ru);
+              }
               const next = await set_game_preset(preset_id);
               setState(next);
             } catch {

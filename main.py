@@ -392,6 +392,35 @@ def _list_game_presets_dicts() -> list[dict[str, str]]:
     return out
 
 
+def _gp_is_list_ipset_preset(preset_id: str) -> bool:
+    """Старые game_presets.py без LIST_IPSET не ломают плагин."""
+    if _game_presets is None:
+        return False
+    fn = getattr(_game_presets, "is_list_ipset_preset", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(preset_id))
+    except Exception:
+        return False
+
+
+def _gp_clear_list_ipset_if_needed(preset_id: str, mdir: str) -> None:
+    if not _gp_is_list_ipset_preset(preset_id):
+        return
+    fn = getattr(_game_presets, "clear_list_ipset_for_preset", None) if _game_presets else None
+    if callable(fn):
+        fn(preset_id, mdir)
+
+
+def _gp_apply_list_ipset_if_needed(preset_id: str, mdir: str) -> None:
+    if not _gp_is_list_ipset_preset(preset_id):
+        return
+    fn = getattr(_game_presets, "apply_list_ipset_for_preset", None) if _game_presets else None
+    if callable(fn):
+        fn(preset_id, mdir)
+
+
 def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tuple[bool, str]:
     """preset_id None / empty / 'none' clears preset; otherwise apply known preset."""
     _maybe_reload_game_presets()
@@ -409,6 +438,8 @@ def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tu
             active_before = _game_presets.get_active_preset_id(mdir)
             if active_before:
                 _game_presets.remove_preset_lines_from_config(active_before, mdir)
+                _gp_clear_list_ipset_if_needed(active_before, mdir)
+                _game_presets.restore_gamefilter_for_preset(active_before, mdir)
             _game_presets.clear_active_preset(mdir)
             return _restart_zapret_service()
 
@@ -416,18 +447,26 @@ def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tu
         active_before = _game_presets.get_active_preset_id(mdir)
         if active_before:
             _game_presets.remove_preset_lines_from_config(active_before, mdir)
+            _gp_clear_list_ipset_if_needed(active_before, mdir)
+            _game_presets.restore_gamefilter_for_preset(active_before, mdir)
 
         _game_presets.set_active_preset(pid, mdir)
         preset = _game_presets.GAME_PRESETS[pid]
-        lines = preset["lines"]
-        config_path = manager / "config.txt"
-        existing = ""
-        if config_path.is_file():
-            existing = config_path.read_text(encoding="utf-8")
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("\n".join(lines) + "\n" + existing, encoding="utf-8")
-    except OSError as e:
-        return False, str(e)
+        tcp = preset.get("game_filter_tcp")
+        udp = preset.get("game_filter_udp")
+        if tcp is not None and udp is not None:
+            _game_presets.substitute_gamefilter_in_config(tcp, udp, mdir)
+        _gp_apply_list_ipset_if_needed(pid, mdir)
+        lines = preset.get("lines") or []
+        if lines:
+            config_path = manager / "config.txt"
+            existing = ""
+            if config_path.is_file():
+                existing = config_path.read_text(encoding="utf-8")
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text("\n".join(lines) + "\n" + existing, encoding="utf-8")
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
     return _restart_zapret_service()
 
@@ -1189,12 +1228,19 @@ class Plugin:
         return await asyncio.to_thread(lambda: {"presets": _list_game_presets_dicts()})
 
     async def set_game_preset(self, preset_id: Optional[Any] = None, **_kw: Any) -> dict:
+        def _resolved_id() -> Optional[str]:
+            raw: Any = preset_id
+            if raw is None and _kw:
+                raw = _kw.get("preset_id")
+            if raw is None:
+                return None
+            s = str(raw).strip()
+            if not s or s.lower() in ("none", "null", ""):
+                return None
+            return s
+
         def _do() -> dict:
-            pid: Optional[str] = None
-            if preset_id is None:
-                pid = None
-            elif isinstance(preset_id, str):
-                pid = preset_id
+            pid = _resolved_id()
             ok, msg = _set_game_preset_impl(_manager_dir(), pid)
             state = _collect_state()
             state["gamefilter_ok"] = ok
