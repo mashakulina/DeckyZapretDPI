@@ -341,6 +341,10 @@ def _apply_strategy_from_file(manager: pathlib.Path, strategy_name: str) -> tupl
         else:
             name_strategy_file.write_text(strategy_name, encoding="utf-8")
             config_file.write_text(strategy_content, encoding="utf-8")
+            # Как в менеджере (strategy_window): после перезаписи config.txt снова применить игровой пресет.
+            _maybe_reload_game_presets()
+            if _game_presets is not None:
+                _game_presets.reapply_active_preset_to_config(str(manager))
     except OSError as e:
         return False, str(e)
     return _restart_zapret_service()
