@@ -29,8 +29,11 @@
   function apply_working_strategy(strategy_name) {
     return call("apply_working_strategy", { strategy_name: strategy_name });
   }
-  function toggle_gamefilter() {
-    return call("toggle_gamefilter", {});
+  function toggle_gamefilter(params) {
+    return call("toggle_gamefilter", params || {});
+  }
+  function set_gamefilter_protocol_mode(mode) {
+    return call("set_gamefilter_protocol_mode", { mode: mode });
   }
   function set_game_preset(preset_id) {
     return call("set_game_preset", { preset_id: preset_id });
@@ -43,6 +46,7 @@
   }
 
   var NONE_PRESET = "none";
+  var GF_POWER_OFF = "off";
   var FALL_GUYS_PRESET_ID = "fall_guys";
   var FALL_GUYS_PRESET_INFO_RU =
     "Данный пресет применяется для игры из Epic Games Store. Для игры из Steam в настройках игры смените регион на США (восток).";
@@ -91,10 +95,12 @@
     var ruM = {
       game_presets_unavailable: "Модуль пресетов недоступен (проверьте Zapret DPI Manager)",
       invalid_preset: "Неизвестный пресет",
+      gamefilter_disabled: "Сначала включите GameFilter",
     };
     var enM = {
       game_presets_unavailable: "Game presets unavailable (check Zapret DPI Manager)",
       invalid_preset: "Unknown preset",
+      gamefilter_disabled: "Turn on GameFilter first",
     };
     var m = ru ? ruM : enM;
     if (m[code]) return m[code];
@@ -102,10 +108,18 @@
     return code && code.length > 80 ? code.slice(0, 80) + "…" : code;
   }
 
+  function gameFilterProtocolSuffix(ru, m) {
+    var mode = ((m || "both") + "").toLowerCase();
+    if (mode === "tcp") return ru ? " · только TCP" : " · TCP only";
+    if (mode === "udp") return ru ? " · только UDP" : " · UDP only";
+    return ru ? " · TCP и UDP" : " · TCP and UDP";
+  }
+
   function gameFilterStatusLine(ru, s) {
     var prefix = ru ? "GameFilter: " : "GameFilter: ";
-    if (s.game_preset_name) return prefix + s.game_preset_name;
-    if (s.gamefilter_enabled) return prefix + (ru ? "включено" : "enabled");
+    var suf = s.gamefilter_enabled ? gameFilterProtocolSuffix(ru, s.gamefilter_protocol_mode) : "";
+    if (s.game_preset_name) return prefix + s.game_preset_name + suf;
+    if (s.gamefilter_enabled) return prefix + (ru ? "включено" : "enabled") + suf;
     return prefix + (ru ? "отключено" : "disabled");
   }
 
@@ -1057,6 +1071,7 @@
             game_preset_id: null,
             game_preset_name: null,
             game_presets_available: false,
+            gamefilter_protocol_mode: "both",
             ipset_filter_mode: "none",
           });
         });
@@ -1172,9 +1187,45 @@
       [state && state.ipset_filter_mode, ipsetModeOptions],
     );
 
-    function runToggleGameFilter() {
+    var gfPowerDropdownOptions = useMemo(
+      function () {
+        return ru
+          ? [
+              { data: GF_POWER_OFF, label: "Выключено" },
+              { data: "both", label: "Включено · TCP и UDP" },
+              { data: "tcp", label: "Включено · только TCP" },
+              { data: "udp", label: "Включено · только UDP" },
+            ]
+          : [
+              { data: GF_POWER_OFF, label: "Off" },
+              { data: "both", label: "On · TCP and UDP" },
+              { data: "tcp", label: "On · TCP only" },
+              { data: "udp", label: "On · UDP only" },
+            ];
+      },
+      [ru],
+    );
+
+    var selectedGfPowerOption = useMemo(
+      function () {
+        if (!(state && state.gamefilter_enabled)) {
+          for (var j = 0; j < gfPowerDropdownOptions.length; j++) {
+            if (gfPowerDropdownOptions[j].data === GF_POWER_OFF) return gfPowerDropdownOptions[j];
+          }
+          return gfPowerDropdownOptions[0];
+        }
+        var m = ((state && state.gamefilter_protocol_mode) || "both").toLowerCase();
+        for (var i = 0; i < gfPowerDropdownOptions.length; i++) {
+          if (gfPowerDropdownOptions[i].data === m) return gfPowerDropdownOptions[i];
+        }
+        return gfPowerDropdownOptions[1];
+      },
+      [state && state.gamefilter_enabled, state && state.gamefilter_protocol_mode, gfPowerDropdownOptions],
+    );
+
+    function runToggleGameFilterOff() {
       setGfBusy(true);
-      toggle_gamefilter()
+      toggle_gamefilter({})
         .then(setState)
         .catch(function () {
           setState(function (prev) {
@@ -1188,6 +1239,50 @@
         .finally(function () {
           setGfBusy(false);
         });
+    }
+
+    function runEnableGameFilterWithProtocol(mode) {
+      setGfBusy(true);
+      toggle_gamefilter({ protocol_mode: mode })
+        .then(setState)
+        .catch(function () {
+          setState(function (prev) {
+            if (!prev) return prev;
+            return Object.assign({}, prev, {
+              gamefilter_ok: false,
+              gamefilter_message: ru ? "Ошибка переключения GameFilter" : "GameFilter toggle failed",
+            });
+          });
+        })
+        .finally(function () {
+          setGfBusy(false);
+        });
+    }
+
+    function openGameFilterEnableWarningModal(onConfirm) {
+      var warnRu =
+        "Фильтр GameFilter — экспериментальная функция. Возможны чёрный экран при переходе в игровой режим, долгая загрузка, проблемы с YouTube и Discord и другие нестабильности. Пользуйтесь на свой страх и риск.";
+      var warnEn =
+        "GameFilter is experimental. You may see a black screen when switching to Gaming Mode, slow boot, broken YouTube/Discord, or other issues. Use at your own risk.";
+      var modal;
+      modal = F.showModal(
+        e(F.ConfirmModal, {
+          strTitle: ru ? "ВНИМАНИЕ!" : "WARNING",
+          strDescription: ru ? warnRu : warnEn,
+          strOKButtonText: ru ? "Включить" : "Enable",
+          strCancelButtonText: ru ? "Отмена" : "Cancel",
+          onOK: function () {
+            modal.Close();
+            window.setTimeout(onConfirm, 150);
+          },
+          closeModal: function () {
+            modal.Close();
+          },
+          onCancel: function () {
+            modal.Close();
+          },
+        }),
+      );
     }
 
     function openFallGuysPresetInfoModal() {
@@ -1212,32 +1307,6 @@
           popupWidth: 440,
           popupHeight: 260,
         },
-      );
-    }
-
-    function openGameFilterEnableModal() {
-      var warnRu =
-        "Фильтр GameFilter — экспериментальная функция. Возможны чёрный экран при переходе в игровой режим, долгая загрузка, проблемы с YouTube и Discord и другие нестабильности. Пользуйтесь на свой страх и риск.";
-      var warnEn =
-        "GameFilter is experimental. You may see a black screen when switching to Gaming Mode, slow boot, broken YouTube/Discord, or other issues. Use at your own risk.";
-      var modal;
-      modal = F.showModal(
-        e(F.ConfirmModal, {
-          strTitle: ru ? "ВНИМАНИЕ!" : "WARNING",
-          strDescription: ru ? warnRu : warnEn,
-          strOKButtonText: ru ? "Включить" : "Enable",
-          strCancelButtonText: ru ? "Отмена" : "Cancel",
-          onOK: function () {
-            modal.Close();
-            runToggleGameFilter();
-          },
-          closeModal: function () {
-            modal.Close();
-          },
-          onCancel: function () {
-            modal.Close();
-          },
-        }),
       );
     }
 
@@ -1461,7 +1530,56 @@
     rows.push(
       e(F.PanelSectionRow, null,
         e(F.DropdownItem, {
-          label: ru ? "Режим GameFilter" : "GameFilter mode",
+          label: ru ? "Включить GameFilter" : "Enable GameFilter",
+          rgOptions: gfPowerDropdownOptions,
+          selectedOption: selectedGfPowerOption,
+          disabled: gfBusy || !state,
+          strDefaultLabel: ru ? "Выберите режим…" : "Choose mode…",
+          renderButtonValue: function (element) {
+            return selectedGfPowerOption ? selectedGfPowerOption.label : element;
+          },
+          onChange: function (opt) {
+            var raw = opt && opt.data;
+            if (raw == null) return;
+            if (raw === GF_POWER_OFF) {
+              if (state && state.gamefilter_enabled) runToggleGameFilterOff();
+              return;
+            }
+            if (raw !== "both" && raw !== "tcp" && raw !== "udp") return;
+            var mode = raw;
+            if (!(state && state.gamefilter_enabled)) {
+              openGameFilterEnableWarningModal(function () {
+                runEnableGameFilterWithProtocol(mode);
+              });
+              return;
+            }
+            var cur = ((state && state.gamefilter_protocol_mode) || "both").toLowerCase();
+            if (String(raw).toLowerCase() === cur) return;
+            setGfBusy(true);
+            set_gamefilter_protocol_mode(raw)
+              .then(function (next) {
+                setState(next);
+              })
+              .catch(function () {
+                setState(function (prev) {
+                  if (!prev) return prev;
+                  return Object.assign({}, prev, {
+                    gamefilter_ok: false,
+                    gamefilter_message: ru ? "Не удалось сменить режим" : "Could not change mode",
+                  });
+                });
+              })
+              .finally(function () {
+                setGfBusy(false);
+              });
+          },
+        }),
+      ),
+    );
+    rows.push(
+      e(F.PanelSectionRow, null,
+        e(F.DropdownItem, {
+          label: ru ? "Пресет для игры" : "Game preset",
           rgOptions: presetDropdownOptions,
           selectedOption: selectedPresetOption,
           disabled: gfBusy || !(state && state.game_presets_available),
@@ -1516,26 +1634,6 @@
       );
     }
     rows.push(
-      e(F.PanelSectionRow, null,
-        e(F.ButtonItem, {
-          layout: "below",
-          disabled: gfBusy || !state,
-          onClick: function () {
-            if (state && state.gamefilter_enabled) runToggleGameFilter();
-            else openGameFilterEnableModal();
-          },
-        },
-          state && state.gamefilter_enabled
-            ? ru
-              ? "Отключить GameFilter"
-              : "Disable GameFilter"
-            : ru
-              ? "Включить GameFilter"
-              : "Enable GameFilter",
-        ),
-      ),
-    );
-    rows.push(
       e(
         F.PanelSectionRow,
         null,
@@ -1543,8 +1641,8 @@
           "span",
           { style: Object.assign({}, panelBodyNoIndent, { fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }) },
           ru
-            ? "Выберите один из вариантов работы GameFilter:\n• с пресетом для игры\n• просто включить фильтр"
-            : "Choose one of the ways to use GameFilter:\n• with a game preset\n• enable the filter only",
+            ? "Отдельный GameFilter и пресет игры не работают одновременно: при выборе одного второй отключается. Либо включите GameFilter (режим TCP/UDP), либо выберите пресет ниже."
+            : "Standalone GameFilter and a game preset cannot run together—choosing one clears the other. Either enable GameFilter (TCP/UDP) or pick a game preset below.",
         ),
       ),
     );

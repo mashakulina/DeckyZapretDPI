@@ -340,7 +340,10 @@ def _apply_strategy_from_file(manager: pathlib.Path, strategy_name: str) -> tupl
             config_file.write_text("", encoding="utf-8")
         else:
             name_strategy_file.write_text(strategy_name, encoding="utf-8")
-            config_file.write_text(strategy_content, encoding="utf-8")
+            config_file.write_text(
+                strategy_content + ("\n" if strategy_content else ""),
+                encoding="utf-8",
+            )
             # Как в менеджере (strategy_window): после перезаписи config.txt снова применить игровой пресет.
             _maybe_reload_game_presets()
             if _game_presets is not None:
@@ -360,6 +363,37 @@ def _restart_zapret_service() -> tuple[bool, str]:
 
 def _gamefilter_enable_path(manager: pathlib.Path) -> pathlib.Path:
     return manager / "utils" / "gamefilter.enable"
+
+
+def _gamefilter_mode_path(manager: pathlib.Path) -> pathlib.Path:
+    return manager / "utils" / "gamefilter.mode"
+
+
+def _normalize_gamefilter_protocol_mode(value: Optional[str]) -> str:
+    v = (value or "").strip().lower()
+    if v in ("both", "tcp", "udp"):
+        return v
+    return "both"
+
+
+def _read_gamefilter_protocol_mode(manager: pathlib.Path) -> str:
+    p = _gamefilter_mode_path(manager)
+    if not p.is_file():
+        return "both"
+    try:
+        text = p.read_text(encoding="utf-8")
+        line = text.splitlines()[0] if text.strip() else ""
+        return _normalize_gamefilter_protocol_mode(line)
+    except OSError:
+        return "both"
+
+
+def _remove_gamefilter_mode_file(manager: pathlib.Path) -> None:
+    p = _gamefilter_mode_path(manager)
+    try:
+        p.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _read_gamefilter_state(manager: pathlib.Path) -> tuple[bool, Optional[str], Optional[str]]:
@@ -421,6 +455,33 @@ def _gp_apply_list_ipset_if_needed(preset_id: str, mdir: str) -> None:
         fn(preset_id, mdir)
 
 
+def _disable_standalone_gamefilter(manager: pathlib.Path) -> None:
+    """Как disable_standalone_gamefilter в менеджере: только файлы, без перезапуска."""
+    try:
+        p = _gamefilter_enable_path(manager)
+        if p.is_file():
+            p.unlink()
+        _remove_gamefilter_mode_file(manager)
+    except OSError:
+        pass
+
+
+def _clear_game_preset_side_effects(manager: pathlib.Path) -> None:
+    """Снимает активный пресет с диска (как clear в set_game_preset). Без перезапуска службы."""
+    _maybe_reload_game_presets()
+    if _game_presets is None:
+        return
+    mdir = str(manager)
+    active_before = _game_presets.get_active_preset_id(mdir)
+    if active_before:
+        _game_presets.remove_preset_lines_from_config(active_before, mdir)
+        _gp_clear_list_ipset_if_needed(active_before, mdir)
+        if active_before == "elite_dangerous":
+            _set_ipset_all_to_none_marker(manager)
+        _game_presets.restore_gamefilter_for_preset(active_before, mdir)
+    _game_presets.clear_active_preset(mdir)
+
+
 def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tuple[bool, str]:
     """preset_id None / empty / 'none' clears preset; otherwise apply known preset."""
     _maybe_reload_game_presets()
@@ -435,19 +496,18 @@ def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tu
 
     try:
         if clear:
-            active_before = _game_presets.get_active_preset_id(mdir)
-            if active_before:
-                _game_presets.remove_preset_lines_from_config(active_before, mdir)
-                _gp_clear_list_ipset_if_needed(active_before, mdir)
-                _game_presets.restore_gamefilter_for_preset(active_before, mdir)
-            _game_presets.clear_active_preset(mdir)
+            _clear_game_preset_side_effects(manager)
             return _restart_zapret_service()
+
+        _disable_standalone_gamefilter(manager)
 
         pid = str(preset_id).strip()
         active_before = _game_presets.get_active_preset_id(mdir)
-        if active_before:
+        if active_before and active_before != pid:
             _game_presets.remove_preset_lines_from_config(active_before, mdir)
             _gp_clear_list_ipset_if_needed(active_before, mdir)
+            if active_before == "elite_dangerous":
+                _set_ipset_all_to_none_marker(manager)
             _game_presets.restore_gamefilter_for_preset(active_before, mdir)
 
         _game_presets.set_active_preset(pid, mdir)
@@ -457,6 +517,8 @@ def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tu
         if tcp is not None and udp is not None:
             _game_presets.substitute_gamefilter_in_config(tcp, udp, mdir)
         _gp_apply_list_ipset_if_needed(pid, mdir)
+        if pid == "elite_dangerous":
+            _apply_ipset_loaded_from_utils(manager)
         lines = preset.get("lines") or []
         if lines:
             config_path = manager / "config.txt"
@@ -471,14 +533,35 @@ def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tu
     return _restart_zapret_service()
 
 
-def _toggle_gamefilter_impl(manager: pathlib.Path) -> tuple[bool, str]:
+def _toggle_gamefilter_impl(
+    manager: pathlib.Path, protocol_mode: Optional[str] = None
+) -> tuple[bool, str]:
+    """Вкл/выкл gamefilter.enable; при выкл удаляет gamefilter.mode; при вкл пишет режим (как в Zapret DPI Manager)."""
     path = _gamefilter_enable_path(manager)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.is_file():
             path.unlink()
+            _remove_gamefilter_mode_file(manager)
         else:
+            _clear_game_preset_side_effects(manager)
             path.write_text("", encoding="utf-8")
+            mode = _normalize_gamefilter_protocol_mode(protocol_mode)
+            mode_path = _gamefilter_mode_path(manager)
+            mode_path.write_text(mode + "\n", encoding="utf-8")
+    except OSError as e:
+        return False, str(e)
+    return _restart_zapret_service()
+
+
+def _set_gamefilter_protocol_mode_impl(manager: pathlib.Path, mode: str) -> tuple[bool, str]:
+    if not _gamefilter_enable_path(manager).is_file():
+        return False, "gamefilter_disabled"
+    m = _normalize_gamefilter_protocol_mode(mode)
+    mode_path = _gamefilter_mode_path(manager)
+    try:
+        mode_path.parent.mkdir(parents=True, exist_ok=True)
+        mode_path.write_text(m + "\n", encoding="utf-8")
     except OSError as e:
         return False, str(e)
     return _restart_zapret_service()
@@ -493,6 +576,23 @@ def _ipset_all_list_path(manager: pathlib.Path) -> pathlib.Path:
 
 def _ipset_all_utils_path(manager: pathlib.Path) -> pathlib.Path:
     return manager / "utils" / "ipset-all.txt"
+
+
+def _set_ipset_all_to_none_marker(manager: pathlib.Path) -> None:
+    """Как GamePresetWindow._set_ipset_none — режим IPsetFilter «none»."""
+    path = _ipset_all_list_path(manager)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_IPSET_NONE_MARKER, encoding="utf-8")
+
+
+def _apply_ipset_loaded_from_utils(manager: pathlib.Path) -> None:
+    """Как GamePresetWindow._apply_ipset_loaded — копия utils/ipset-all.txt в lists (режим «loaded»)."""
+    src = _ipset_all_utils_path(manager)
+    dst = _ipset_all_list_path(manager)
+    if not src.is_file():
+        raise FileNotFoundError(f"Нет файла {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def _read_ipset_filter_mode(manager: pathlib.Path) -> str:
@@ -567,6 +667,7 @@ def _collect_state() -> dict:
         "game_preset_id": gf_pid,
         "game_preset_name": gf_name,
         "game_presets_available": _game_presets is not None,
+        "gamefilter_protocol_mode": _read_gamefilter_protocol_mode(manager),
         "ipset_filter_mode": _read_ipset_filter_mode(manager),
     }
 
@@ -1249,12 +1350,22 @@ class Plugin:
 
         return await asyncio.to_thread(_do)
 
-    async def toggle_gamefilter(self) -> dict:
+    async def toggle_gamefilter(
+        self, protocol_mode: Optional[Any] = None, **_kw: Any
+    ) -> dict:
+        def _resolved_protocol_mode() -> Optional[str]:
+            raw: Any = protocol_mode
+            if raw is None and _kw:
+                raw = _kw.get("protocol_mode")
+            if raw is None:
+                return None
+            return str(raw).strip()
+
         def _do() -> dict:
             manager = _manager_dir()
             path = _gamefilter_enable_path(manager)
             was_enabled = path.is_file()
-            ok, msg = _toggle_gamefilter_impl(manager)
+            ok, msg = _toggle_gamefilter_impl(manager, _resolved_protocol_mode())
             state = _collect_state()
             if not ok:
                 state["gamefilter_ok"] = False
@@ -1265,6 +1376,24 @@ class Plugin:
             else:
                 state["gamefilter_ok"] = True
                 state["gamefilter_message"] = msg
+            return state
+
+        return await asyncio.to_thread(_do)
+
+    async def set_gamefilter_protocol_mode(
+        self, mode: Optional[Any] = None, **_kw: Any
+    ) -> dict:
+        def _resolved_mode() -> str:
+            raw: Any = mode
+            if raw is None and _kw:
+                raw = _kw.get("mode")
+            return str(raw or "").strip()
+
+        def _do() -> dict:
+            ok, msg = _set_gamefilter_protocol_mode_impl(_manager_dir(), _resolved_mode())
+            state = _collect_state()
+            state["gamefilter_ok"] = ok
+            state["gamefilter_message"] = msg
             return state
 
         return await asyncio.to_thread(_do)

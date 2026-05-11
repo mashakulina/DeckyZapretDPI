@@ -43,6 +43,8 @@ export type ZapretState = {
   game_preset_id?: string | null;
   game_preset_name?: string | null;
   game_presets_available?: boolean;
+  /** both | tcp | udp — файл utils/gamefilter.mode (starter.sh) */
+  gamefilter_protocol_mode?: string;
   gamefilter_ok?: boolean;
   gamefilter_message?: string;
   ipset_filter_mode?: string;
@@ -65,7 +67,10 @@ const get_zapret_state = () => call<ZapretState>("get_zapret_state", {});
 const toggle_zapret = () => call<ZapretState>("toggle_zapret", {});
 const apply_working_strategy = (strategy_name: string) =>
   call<ZapretState>("apply_working_strategy", { strategy_name });
-const toggle_gamefilter = () => call<ZapretState>("toggle_gamefilter", {});
+const toggle_gamefilter = (params?: { protocol_mode?: string }) =>
+  call<ZapretState>("toggle_gamefilter", params ?? {});
+const set_gamefilter_protocol_mode = (mode: string) =>
+  call<ZapretState>("set_gamefilter_protocol_mode", { mode });
 const set_game_preset = (preset_id: string | null) =>
   call<ZapretState>("set_game_preset", { preset_id });
 const list_game_presets = () => call<{ presets: GamePresetRow[] }>("list_game_presets", {});
@@ -112,10 +117,12 @@ function gamePresetErrorText(ru: boolean, code: string): string {
   const ruM: Record<string, string> = {
     game_presets_unavailable: "Модуль пресетов недоступен (проверьте Zapret DPI Manager)",
     invalid_preset: "Неизвестный пресет",
+    gamefilter_disabled: "Сначала включите GameFilter",
   };
   const enM: Record<string, string> = {
     game_presets_unavailable: "Game presets unavailable (check Zapret DPI Manager)",
     invalid_preset: "Unknown preset",
+    gamefilter_disabled: "Turn on GameFilter first",
   };
   const m = ru ? ruM : enM;
   if (code in m) return m[code];
@@ -123,10 +130,18 @@ function gamePresetErrorText(ru: boolean, code: string): string {
   return code.length > 80 ? code.slice(0, 80) + "…" : code;
 }
 
+function gameFilterProtocolSuffix(ru: boolean, m: string | undefined): string {
+  const mode = (m || "both").toLowerCase();
+  if (mode === "tcp") return ru ? " · только TCP" : " · TCP only";
+  if (mode === "udp") return ru ? " · только UDP" : " · UDP only";
+  return ru ? " · TCP и UDP" : " · TCP and UDP";
+}
+
 function gameFilterStatusLine(ru: boolean, s: ZapretState): string {
   const prefix = ru ? "GameFilter: " : "GameFilter: ";
-  if (s.game_preset_name) return prefix + s.game_preset_name;
-  if (s.gamefilter_enabled) return prefix + (ru ? "включено" : "enabled");
+  const suf = s.gamefilter_enabled ? gameFilterProtocolSuffix(ru, s.gamefilter_protocol_mode) : "";
+  if (s.game_preset_name) return prefix + s.game_preset_name + suf;
+  if (s.gamefilter_enabled) return prefix + (ru ? "включено" : "enabled") + suf;
   return prefix + (ru ? "отключено" : "disabled");
 }
 
@@ -159,6 +174,33 @@ const FALL_GUYS_PRESET_INFO_RU =
   "Данный пресет применяется для игры из Epic Games Store. Для игры из Steam в настройках игры смените регион на США (восток).";
 const FALL_GUYS_PRESET_INFO_EN =
   "This preset applies to the Epic Games Store version. For the Steam version, set the in-game region to USA (East).";
+
+type GameFilterProtocolMode = "both" | "tcp" | "udp";
+
+const GF_POWER_OFF = "off";
+
+/** Предупреждение перед первым включением GameFilter (режим уже выбран в выпадающем списке). */
+function openGameFilterEnableWarningModal(ru: boolean, onConfirm: () => void) {
+  const warnRu =
+    "Фильтр GameFilter — экспериментальная функция. Возможны чёрный экран при переходе в игровой режим, долгая загрузка, проблемы с YouTube и Discord и другие нестабильности. Пользуйтесь на свой страх и риск.";
+  const warnEn =
+    "GameFilter is experimental. You may see a black screen when switching to Gaming Mode, slow boot, broken YouTube/Discord, or other issues. Use at your own risk.";
+  let modal: ReturnType<typeof showModal>;
+  modal = showModal(
+    <ConfirmModal
+      strTitle={ru ? "ВНИМАНИЕ!" : "WARNING"}
+      strDescription={ru ? warnRu : warnEn}
+      strOKButtonText={ru ? "Включить" : "Enable"}
+      strCancelButtonText={ru ? "Отмена" : "Cancel"}
+      onOK={() => {
+        modal.Close();
+        window.setTimeout(onConfirm, 150);
+      }}
+      closeModal={() => modal.Close()}
+      onCancel={() => modal.Close()}
+    />,
+  );
+}
 
 function openFallGuysPresetInfoModal(ru: boolean) {
   const title = ru ? "Пресет Fall Guys" : "Fall Guys preset";
@@ -428,6 +470,7 @@ const Content = () => {
         game_preset_id: null,
         game_preset_name: null,
         game_presets_available: false,
+        gamefilter_protocol_mode: "both",
         ipset_filter_mode: "none",
       });
     }
@@ -505,9 +548,36 @@ const Content = () => {
     return hit ?? ipsetModeOptions[0];
   }, [state?.ipset_filter_mode, ipsetModeOptions]);
 
-  const runToggleGameFilter = () => {
+  const gfPowerDropdownOptions = useMemo(
+    () =>
+      ru
+        ? [
+            { data: GF_POWER_OFF, label: "Выключено" },
+            { data: "both", label: "Включено · TCP и UDP" },
+            { data: "tcp", label: "Включено · только TCP" },
+            { data: "udp", label: "Включено · только UDP" },
+          ]
+        : [
+            { data: GF_POWER_OFF, label: "Off" },
+            { data: "both", label: "On · TCP and UDP" },
+            { data: "tcp", label: "On · TCP only" },
+            { data: "udp", label: "On · UDP only" },
+          ],
+    [ru],
+  );
+
+  const selectedGfPowerOption = useMemo(() => {
+    if (!state?.gamefilter_enabled) {
+      return gfPowerDropdownOptions.find((o) => o.data === GF_POWER_OFF) ?? gfPowerDropdownOptions[0];
+    }
+    const m = (state.gamefilter_protocol_mode || "both").toLowerCase();
+    const hit = gfPowerDropdownOptions.find((o) => o.data === m);
+    return hit ?? gfPowerDropdownOptions[1];
+  }, [state?.gamefilter_enabled, state?.gamefilter_protocol_mode, gfPowerDropdownOptions]);
+
+  const runToggleGameFilterOff = () => {
     setGfBusy(true);
-    toggle_gamefilter()
+    toggle_gamefilter({})
       .then(setState)
       .catch(() =>
         setState((prev) =>
@@ -523,26 +593,22 @@ const Content = () => {
       .finally(() => setGfBusy(false));
   };
 
-  const openGameFilterEnableModal = () => {
-    const warnRu =
-      "Фильтр GameFilter — экспериментальная функция. Возможны чёрный экран при переходе в игровой режим, долгая загрузка, проблемы с YouTube и Discord и другие нестабильности. Пользуйтесь на свой страх и риск.";
-    const warnEn =
-      "GameFilter is experimental. You may see a black screen when switching to Gaming Mode, slow boot, broken YouTube/Discord, or other issues. Use at your own risk.";
-    let modal: ReturnType<typeof showModal>;
-    modal = showModal(
-      <ConfirmModal
-        strTitle={ru ? "ВНИМАНИЕ!" : "WARNING"}
-        strDescription={ru ? warnRu : warnEn}
-        strOKButtonText={ru ? "Включить" : "Enable"}
-        strCancelButtonText={ru ? "Отмена" : "Cancel"}
-        onOK={() => {
-          modal.Close();
-          runToggleGameFilter();
-        }}
-        closeModal={() => modal.Close()}
-        onCancel={() => modal.Close()}
-      />,
-    );
+  const runEnableGameFilterWithProtocol = (mode: GameFilterProtocolMode) => {
+    setGfBusy(true);
+    toggle_gamefilter({ protocol_mode: mode })
+      .then(setState)
+      .catch(() =>
+        setState((prev) =>
+          prev
+            ? {
+                ...prev,
+                gamefilter_ok: false,
+                gamefilter_message: ru ? "Ошибка переключения GameFilter" : "GameFilter toggle failed",
+              }
+            : prev,
+        ),
+      )
+      .finally(() => setGfBusy(false));
   };
 
   if (!state) {
@@ -689,7 +755,52 @@ const Content = () => {
       </PanelSectionRow>
       <PanelSectionRow>
         <DropdownItem
-          label={ru ? "Режим GameFilter" : "GameFilter mode"}
+          label={ru ? "Включить GameFilter" : "Enable GameFilter"}
+          rgOptions={gfPowerDropdownOptions}
+          selectedOption={selectedGfPowerOption}
+          disabled={gfBusy || !state}
+          strDefaultLabel={ru ? "Выберите режим…" : "Choose mode…"}
+          renderButtonValue={(element) =>
+            selectedGfPowerOption ? selectedGfPowerOption.label : element
+          }
+          onChange={async (opt) => {
+            const raw = opt?.data as string | undefined;
+            if (raw == null) return;
+            if (raw === GF_POWER_OFF) {
+              if (state?.gamefilter_enabled) runToggleGameFilterOff();
+              return;
+            }
+            if (raw !== "both" && raw !== "tcp" && raw !== "udp") return;
+            const mode = raw as GameFilterProtocolMode;
+            if (!state?.gamefilter_enabled) {
+              openGameFilterEnableWarningModal(ru, () => runEnableGameFilterWithProtocol(mode));
+              return;
+            }
+            const cur = (state.gamefilter_protocol_mode || "both").toLowerCase();
+            if (raw.toLowerCase() === cur) return;
+            setGfBusy(true);
+            try {
+              const next = await set_gamefilter_protocol_mode(raw);
+              setState(next);
+            } catch {
+              setState((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      gamefilter_ok: false,
+                      gamefilter_message: ru ? "Не удалось сменить режим" : "Could not change mode",
+                    }
+                  : prev,
+              );
+            } finally {
+              setGfBusy(false);
+            }
+          }}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DropdownItem
+          label={ru ? "Пресет для игры" : "Game preset"}
           rgOptions={presetDropdownOptions}
           selectedOption={selectedPresetOption}
           disabled={gfBusy || !state?.game_presets_available}
@@ -737,28 +848,10 @@ const Content = () => {
         </PanelSectionRow>
       ) : null}
       <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          disabled={gfBusy || !state}
-          onClick={() => {
-            if (state?.gamefilter_enabled) runToggleGameFilter();
-            else openGameFilterEnableModal();
-          }}
-        >
-          {state?.gamefilter_enabled
-            ? ru
-              ? "Отключить GameFilter"
-              : "Disable GameFilter"
-            : ru
-              ? "Включить GameFilter"
-              : "Enable GameFilter"}
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
         <span style={{ ...panelBodyNoIndent, fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
           {ru
-            ? "Выберите один из вариантов работы GameFilter:\n• с пресетом для игры\n• просто включить фильтр"
-            : "Choose one of the ways to use GameFilter:\n• with a game preset\n• enable the filter only"}
+            ? "Отдельный GameFilter и пресет игры не работают одновременно: при выборе одного второй отключается. Либо включите GameFilter (режим TCP/UDP), либо выберите пресет ниже."
+            : "Standalone GameFilter and a game preset cannot run together—choosing one clears the other. Either enable GameFilter (TCP/UDP) or pick a game preset below."}
         </span>
       </PanelSectionRow>
       <PanelSectionRow>
