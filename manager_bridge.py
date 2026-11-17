@@ -1,27 +1,120 @@
 """Headless manager operations shared by Decky controls and autopicker."""
 import ast
 from contextlib import contextmanager
+from contextvars import ContextVar
 import importlib
+import importlib.util
+import importlib.machinery
+import _imp
 import os
 from pathlib import Path
 import sys
+import types
+import threading
 
 
-def manager_module(root, name):
+# main and autopicker load this bridge by file path under different names.
+# A stable registry key keeps diagnostics/handlers shared across those imports.
+def _load_diagnostics():
+    key = '_decky_zapret_plugin_diagnostics'
+    # Only reserve the shared mutex under Python's global import lock. Do not
+    # hold that lock while executing code which may import other modules.
+    _imp.acquire_lock()
+    try:
+        state = sys.modules.get(key + '_state')
+        if state is None:
+            state = types.ModuleType(key + '_state')
+            state.lock = threading.RLock()
+            sys.modules[key + '_state'] = state
+    finally:
+        _imp.release_lock()
+    with state.lock:
+        module = sys.modules.get(key)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name('plugin_diagnostics.py'))
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[key] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(key, None)
+                raise
+        return module
+
+
+diagnostics = _load_diagnostics()
+
+
+_operation_name = ContextVar('decky_manager_operation', default='manager.import')
+
+def _failure(operation, error, root, **context):
+    error_id = getattr(error, 'diagnostics_error_id', None)
+    if error_id is None:
+        error_id = diagnostics.record_exception(operation, error, manager_path=str(root),
+            core_paths=list(getattr(sys.modules.get('core'), '__path__', [])), **context)
+        try:
+            error.diagnostics_error_id = error_id
+        except Exception:
+            pass
+    return f'{type(error).__name__}: {error} [ID: {error_id}]'
+
+
+def _inside(path, directory):
+    return Path(path).resolve().is_relative_to(directory)
+
+
+def manager_module(root, name, operation_name=None):
     root = Path(root).resolve()
-    loaded = sys.modules.get('core')
-    if loaded is not None:
-        source = getattr(loaded, '__file__', None)
-        if source and Path(source).resolve().parent != root / 'core':
-            raise RuntimeError('Другой каталог менеджера уже загружен; перезапустите плагин.')
-    location = str(root)
-    if location in sys.path:
-        sys.path.remove(location)
-    sys.path.insert(0, location)
-    module = importlib.import_module('core.' + name)
-    if not Path(module.__file__).resolve().is_relative_to(root / 'core'):
-        raise RuntimeError('Модуль менеджера загружен из другого каталога.')
-    return module
+    directory = root / 'core'
+    try:
+        if not name or any(not part.isidentifier() for part in name.split('.')):
+            raise ValueError('Invalid manager module name')
+        # Never discard already loaded children: config_lock contains shared locks.
+        # A stale namespace alone is safe to repair, a foreign child is not.
+        with diagnostics._manager_import_lock:
+            for key, child in list(sys.modules.items()):
+                if not key.startswith('core.') or child is None:
+                    continue
+                source = getattr(child, '__file__', None)
+                paths = list(getattr(child, '__path__', []))
+                if ((source and _inside(source, directory)) or
+                        (not source and paths and all(_inside(p, directory) for p in paths))):
+                    continue
+                raise RuntimeError(f'Модуль {key} ({source or paths}) загружен из другого каталога; перезапустите плагин.')
+            loaded = sys.modules.get('core')
+            source = getattr(loaded, '__file__', None)
+            if source and Path(source).resolve().parent != directory:
+                raise RuntimeError('Другой каталог менеджера уже загружен; перезапустите плагин.')
+            if loaded is None:
+                loaded = types.ModuleType('core')
+                loaded.__package__ = 'core'
+                sys.modules['core'] = loaded
+            loaded.__path__ = [str(directory)]
+            spec = importlib.machinery.ModuleSpec('core', loader=None, is_package=True)
+            spec.submodule_search_locations = loaded.__path__
+            loaded.__spec__ = spec
+            importlib.invalidate_caches()
+            already_loaded = 'core.' + name in sys.modules
+            import_spec = importlib.util.find_spec('core.' + name)
+            if import_spec and import_spec.origin and not _inside(import_spec.origin, directory):
+                raise RuntimeError(f'Модуль core.{name} ({import_spec.origin}) находится в другом каталоге; восстановите менеджер и перезапустите плагин.')
+            module = importlib.import_module('core.' + name)
+            if not getattr(module, '__file__', None) or not _inside(module.__file__, directory):
+                raise RuntimeError('Модуль менеджера загружен из другого каталога; перезапустите плагин.')
+            if not already_loaded:
+                diagnostics.record_event(operation_name or _operation_name.get(), 'loaded', phase='import',
+                    manager_path=str(root), module='core.' + name, module_path=module.__file__,
+                    core_paths=loaded.__path__, version=diagnostics._manager_version(root))
+            return module
+    except Exception as error:
+        message = _failure(operation_name or _operation_name.get(), error, root, phase='import', module='core.' + name,
+                           module_path=str(directory / (name.replace('.', '/') + '.py')),
+                           version=diagnostics._manager_version(root))
+        if isinstance(error, ModuleNotFoundError):
+            wrapped = RuntimeError(f'Отсутствует модуль {error.name}; обновите или восстановите менеджер. {message}')
+            wrapped.diagnostics_error_id = error.diagnostics_error_id
+            raise wrapped from error
+        raise
 
 
 def _snapshot(paths):
@@ -62,16 +155,21 @@ def manager_change(root, restart=None):
             raise
 
 
-def mutate(root, operation, restart):
+def mutate(root, operation, restart, operation_name="manager.mutate"):
+    token = _operation_name.set(operation_name)
     try:
+        diagnostics.record_event(operation_name, 'started', manager_path=str(root), phase='apply')
         with manager_change(root, restart):
             operation()
+        diagnostics.record_event(operation_name, 'completed', manager_path=str(root), phase='apply')
         return True, 'ok'
     except Exception as error:
-        return False, f'{type(error).__name__}: {error}'
+        return False, _failure(operation_name, error, root, phase='apply')
+    finally:
+        _operation_name.reset(token)
 
 
-def apply_strategy(root, strategy_name, restart):
+def apply_strategy(root, strategy_name, restart, operation_name="manager.apply_strategy"):
     root = Path(root)
     if (not strategy_name or strategy_name.startswith('.') or '..' in strategy_name
             or '/' in strategy_name or '\\' in strategy_name):
@@ -83,20 +181,20 @@ def apply_strategy(root, strategy_name, restart):
         path = root / 'files/strategy' / strategy_name
         content = path.read_text(encoding='utf-8').strip()
     except OSError as error:
-        return False, str(error)
+        return False, _failure(operation_name, error, root, phase="validate")
     if not content:
         return False, 'Пустой config не применён.'
     try:
-        manager_module(root, 'strategy_payloads').validate_payloads(content, root)
+        manager_module(root, 'strategy_payloads', operation_name=operation_name).validate_payloads(content, root)
     except Exception as error:
-        return False, str(error)
+        return False, _failure(operation_name, error, root, phase="validate")
     def save():
         (root / 'utils').mkdir(parents=True, exist_ok=True)
         (root / 'utils/name_strategy.txt').write_text(strategy_name if content else '', encoding='utf-8')
         (root / 'config.txt').write_text(content + ('\n' if content else ''), encoding='utf-8')
         # Reapply the active game mode exactly as the desktop does.
         manager_module(root, 'game_presets').reapply_active_preset_to_config(str(root))
-    return mutate(root, save, restart)
+    return mutate(root, save, restart, operation_name=operation_name)
 
 
 def validate_bundle_version(bundle, configured):

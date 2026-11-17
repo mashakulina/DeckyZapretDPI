@@ -20,6 +20,37 @@ _bridge_spec = importlib.util.spec_from_file_location("decky_manager_bridge", Pa
 _bridge = importlib.util.module_from_spec(_bridge_spec)
 _bridge_spec.loader.exec_module(_bridge)
 
+def _diagnostic_event(status: str, **context: Any) -> None:
+    try:
+        _bridge.diagnostics.record_event("autopicker", status, manager_path=str(_MANAGER), **context)
+    except Exception:
+        pass
+
+
+def _diagnostic_exception(operation: str, error: Exception) -> str:
+    try:
+        return _bridge.diagnostics.record_exception(operation, error, manager_path=str(_MANAGER))
+    except Exception:
+        return ""
+
+
+_last_import_failure: Optional[str] = None
+
+
+def _import_failure(error: Exception) -> str:
+    # get_status polls import availability; record only a changed failure.
+    global _last_import_failure
+    message = f"{type(error).__name__}: {error}"
+    if message == _last_import_failure:
+        return _import_err or message
+    if message != _last_import_failure:
+        _last_import_failure = message
+        error_id = _diagnostic_exception("autopicker.import", error)
+        if error_id:
+            message += f" [ID: {error_id}]"
+    return message
+
+
 _MAX_LOG_CHARS = 96_000
 _LOG_LINES: collections.deque[str] = collections.deque(maxlen=5000)
 _log_lock = threading.Lock()
@@ -420,7 +451,7 @@ def _make_decky_subclass(Base: type) -> type:
 
 def _ensure_strategy_tester() -> bool:
     """Подгружает StrategyTester с диска при первом запросе (после установки менеджера без перезапуска Decky)."""
-    global _StrategyTester, DeckyStrategyTester, _import_err
+    global _StrategyTester, DeckyStrategyTester, _import_err, _last_import_failure
     if DeckyStrategyTester is not None:
         return True
     with _import_lock:
@@ -429,7 +460,7 @@ def _ensure_strategy_tester() -> bool:
         _ensure_manager_on_syspath()
         st_path = _CORE / "strategy_tester.py"
         if not st_path.is_file():
-            _import_err = f"Файл не найден: {st_path}"
+            _import_err = _import_failure(FileNotFoundError(f"Файл не найден: {st_path}"))
             _StrategyTester = None
             DeckyStrategyTester = None
             return False
@@ -440,21 +471,22 @@ def _ensure_strategy_tester() -> bool:
             _bridge.manager_module(_MANAGER, 'game_presets')
             spec = importlib.util.spec_from_file_location(mod_name, st_path)
             if spec is None or spec.loader is None:
-                _import_err = "spec_from_file_location failed"
+                _import_err = _import_failure(ImportError("spec_from_file_location failed"))
                 return False
             mod = importlib.util.module_from_spec(spec)
             sys.modules[mod_name] = mod
             spec.loader.exec_module(mod)
             base = getattr(mod, "StrategyTester", None)
             if not isinstance(base, type):
-                _import_err = "StrategyTester is not a class"
+                _import_err = _import_failure(TypeError("StrategyTester is not a class"))
                 return False
             _StrategyTester = base
             DeckyStrategyTester = _make_decky_subclass(base)
             _import_err = None
+            _last_import_failure = None
             return True
         except Exception as e:
-            _import_err = f"{type(e).__name__}: {e}"
+            _import_err = _import_failure(e)
             _StrategyTester = None
             DeckyStrategyTester = None
             if mod_name in sys.modules:
@@ -677,8 +709,9 @@ def stop() -> dict:
     if t is not None:
         try:
             t.stop_testing()
-        except Exception:
-            pass
+        except Exception as error:
+            _diagnostic_exception("autopicker.stop", error)
+        _diagnostic_event("stop_requested")
         return {"ok": True, "detail": "stop_requested"}
     return {"ok": False, "detail": "not_running"}
 
@@ -707,6 +740,7 @@ def start(strategies: Optional[list[str]] = None) -> dict:
         old_out, old_err = sys.stdout, sys.stderr
 
         try:
+            _diagnostic_event("started")
             with _bridge.manager_change(_MANAGER, restart=_restart_zapret_for_autopick):
                 sys.stdout = cap  # type: ignore[assignment]
                 sys.stderr = cap  # type: ignore[assignment]
@@ -764,6 +798,9 @@ def start(strategies: Optional[list[str]] = None) -> dict:
                     "Автовыбор: ни одна стратегия не прошла порог — активная конфигурация не менялась."
                 )
 
+            _diagnostic_event("finished", phase="stopped" if stopped else "done")
+            if best and best in working_set and not stopped and not apply_ok:
+                _diagnostic_exception("autopicker.apply", RuntimeError(apply_msg))
             _set_state(
                 phase="done",
                 message="Тестирование завершено.",
@@ -771,10 +808,12 @@ def start(strategies: Optional[list[str]] = None) -> dict:
                 working_count=wc,
             )
         except Exception as e:
+            error_id = _diagnostic_exception("autopicker.run", e)
+            detail = str(e) + (f" [ID: {error_id}]" if error_id else "")
             _set_state(
                 phase="error",
-                error=str(e),
-                message=str(e)[:240],
+                error=detail,
+                message=detail,
                 finished_at=time.time(),
             )
         finally:
