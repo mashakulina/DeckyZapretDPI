@@ -1,6 +1,6 @@
 {
   "name": "decky-zapretdpi",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Decky plugin for Zapret DPI Manager \u2014 service toggle and status",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",
