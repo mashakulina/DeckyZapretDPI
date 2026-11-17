@@ -28,6 +28,7 @@ def _read_local_version_fallback() -> dict:
     try:
         data = json.loads(_plugin_json_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
+        _bridge.diagnostics.record_exception("read_plugin_version", e)
         return {
             "ok": False,
             "current_version": "",
@@ -324,13 +325,16 @@ def _restart_zapret_service() -> tuple[bool, str]:
     try:
         result = _run_systemctl("restart", "zapret")
         if result.returncode != 0:
-            return False, (result.stdout or "").strip()[:200] or "systemctl failed"
+            error = RuntimeError((result.stdout or '').strip()[:200] or 'systemctl failed')
+            error_id = _bridge.diagnostics.record_exception('restart_zapret_service', error)
+            return False, f'{error} (ID: {error_id})'
         active = _run_systemctl("is-active", "zapret")
         if active.returncode != 0 or (active.stdout or '').strip() != 'active':
             return False, 'Служба Zapret не активна после перезапуска.'
         return True, "ok"
     except Exception as error:
-        return False, str(error)
+        error_id = _bridge.diagnostics.record_exception('restart_zapret_service', error)
+        return False, f'{error} (ID: {error_id})'
 
 
 def _gamefilter_enable_path(manager: pathlib.Path) -> pathlib.Path:
@@ -873,270 +877,91 @@ def _get_manager_install_state_thread() -> dict:
     return {"manager_installed": ok, "zapret_service_installed": _zapret_service_installed()}
 
 
-# --- Plugin self-update (DeckyWARP-style: GitHub releases/latest, systemd-run + bash) ---
-
-_GITHUB_API_LATEST = (
-    "https://api.github.com/repos/mashakulina/DeckyZapretDPI/releases/latest"
-)
-_UPD_FLAG = pathlib.Path("/tmp/.deckyzapretdpi_updating")
-_UPD_LOG = pathlib.Path("/tmp/deckyzapretdpi_update.log")
+# Release updates run outside Decky's process so loader restart cannot kill them.
+_updater_spec = importlib.util.spec_from_file_location("decky_plugin_updater", pathlib.Path(__file__).with_name("plugin_updater.py"))
+_updater = importlib.util.module_from_spec(_updater_spec)
+_updater_spec.loader.exec_module(_updater)
 _UPD_UNIT = "deckyzapretdpi-update"
-_CHK_FLAG = pathlib.Path("/tmp/.deckyzapretdpi_checking")
-_CHK_LOG = pathlib.Path("/tmp/deckyzapretdpi_check.log")
-_CHK_UNIT = "deckyzapretdpi-check"
-
-
-def _decky_subprocess_unit_state(unit_base: str) -> str:
-    try:
-        r = subprocess.run(
-            ["systemctl", "show", unit_base, "-p", "ActiveState"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=15,
-            env=_clean_env(),
-        )
-        for line in (r.stdout or "").splitlines():
-            if line.startswith("ActiveState="):
-                return line.split("=", 1)[1].strip()
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    return "inactive"
-
-
-def _decky_cleanup_flag(flag: pathlib.Path, unit_base: str) -> None:
-    if flag.exists() and _decky_subprocess_unit_state(unit_base) in ("inactive", "failed"):
-        flag.unlink(missing_ok=True)
-
-
-def _decky_flag_busy(flag: pathlib.Path) -> bool:
-    return flag.exists()
-
-
-def _write_deckyzapretdpi_check_script() -> str:
-    pj = shlex.quote(str(_plugin_json_path()))
-    path = pathlib.Path("/tmp/deckyzapretdpi_check.sh")
-    path.write_text(
-        f"""#!/bin/bash
-set -e
-exec > >(tee -a /tmp/deckyzapretdpi_check.log) 2>&1
-echo "== START CHECK: $(date)"
-RESP_JSON="/tmp/deckyzapretdpi_github_release.json"
-PLUGIN_JSON_PATH={pj}
-curl -fsSL -H 'Accept: application/vnd.github+json' "{_GITHUB_API_LATEST}" -o "$RESP_JSON" \\
-  || {{ echo "ERROR: curl failed"; exit 1; }}
-LATEST=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); print(str(d.get("tag_name","") or "").lstrip("v"))' "$RESP_JSON")
-CURRENT=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); print(str(d.get("version","")).strip())' "$PLUGIN_JSON_PATH")
-if [ "$LATEST" != "$CURRENT" ]; then
-  echo "update_available $LATEST $CURRENT"
-else
-  echo "up_to_date $CURRENT"
-fi
-""",
-        encoding="utf-8",
-    )
-    path.chmod(0o755)
-    return str(path)
-
-
-def _write_deckyzapretdpi_update_script() -> str:
-    plugin_dir = shlex.quote(str(_plugin_json_path().parent))
-    path = pathlib.Path("/tmp/deckyzapretdpi_update.sh")
-    path.write_text(
-        f"""#!/bin/bash
-set -e
-exec > >(tee -a /tmp/deckyzapretdpi_update.log) 2>&1
-echo "== START UPDATE: $(date)"
-PLUGIN_DIR={plugin_dir}
-TMP_DIR="/tmp/deckyzapretdpi_update"
-ZIP_URL="{_GITHUB_API_LATEST}"
-mkdir -p "$TMP_DIR"
-cd "$TMP_DIR"
-echo "== FETCHING ASSET URL =="
-ASSET_URL=$(curl -fsSL "$ZIP_URL" | grep '"zipball_url":' | head -1 | cut -d '"' -f 4)
-[ -z "$ASSET_URL" ] && echo "ERROR: no asset url" && exit 1
-echo "== DOWNLOADING ZIP =="
-curl -fsSL -o latest.zip "$ASSET_URL"
-[ ! -f latest.zip ] && echo "ERROR: download failed" && exit 1
-echo "== UNZIPPING =="
-unzip -qo latest.zip || {{ echo "ERROR: unzip failed"; exit 1; }}
-INNER_DIR=$(find . -maxdepth 1 -type d -name "*DeckyZapretDPI*" | head -n 1)
-if [ ! -d "$INNER_DIR" ]; then
-  INNER_DIR=$(find . -maxdepth 1 -mindepth 1 -type d | head -n 1)
-fi
-[ ! -d "$INNER_DIR" ] && echo "ERROR: inner dir not found" && exit 1
-for required in main.py decky_autopicker.py manager_bridge.py plugin.json dist/index.js; do
- [ -f "$INNER_DIR/$required" ] || {{ echo "ERROR: missing $required"; exit 1; }}
-done
-echo "== COPYING PLUGIN =="
-BACKUP="${{PLUGIN_DIR}}_backup_$(date +%s)"
-cp -r "$PLUGIN_DIR" "$BACKUP" || true
-rm -rf "$PLUGIN_DIR"
-cp -r "$INNER_DIR" "$PLUGIN_DIR"
-echo "== CLEANING BACKUP =="
-rm -rf "$BACKUP"
-rm -rf "$TMP_DIR"
-echo "== RESTARTING DECKY =="
-systemctl restart plugin_loader.service
-echo "== DONE: $(date)"
-""",
-        encoding="utf-8",
-    )
-    path.chmod(0o755)
-    return str(path)
-
-
-def _fetch_github_release_changelog() -> str:
-    """Парсинг body релиза как в DeckyWARP (_fetch_changelog)."""
-    req = urllib.request.Request(
-        _GITHUB_API_LATEST,
-        headers={
-            "User-Agent": "DeckyZapretDPI-Plugin/1.0",
-            "Accept": "application/vnd.github+json",
-        },
-    )
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        with urllib.request.urlopen(req, timeout=20.0, context=ctx) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        body = data.get("body", "") or ""
-        lines = body.splitlines()
-        ru_lines: list[str] = []
-        mode = 0
-        for line in lines:
-            if line.strip().startswith("## **Changelog**"):
-                mode = 1
-                continue
-            if line.strip().startswith("## **Список изменений**"):
-                mode = 2
-                continue
-            if line.strip().startswith("#"):
-                mode = 0
-                continue
-            if mode == 2:
-                ru_lines.append(line)
-        if ru_lines:
-            text = "\n".join(ru_lines).strip()
-            if text:
-                return "Список изменений\n\n" + text
-        return ""
-    except Exception as e:
-        return f"[changelog error] {e}"
 
 
 def _check_plugin_updates_thread() -> dict:
-    _decky_cleanup_flag(_CHK_FLAG, _CHK_UNIT)
-    if _decky_flag_busy(_CHK_FLAG):
-        return {"status": "checking"}
-    _CHK_FLAG.touch()
     try:
-        script = _write_deckyzapretdpi_check_script()
-        r = subprocess.run(
-            [
-                "systemd-run",
-                "--unit",
-                _CHK_UNIT,
-                "--service-type=oneshot",
-                "--quiet",
-                script,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=120,
-            env=_clean_env(),
-        )
-        if r.returncode != 0:
-            _CHK_FLAG.unlink(missing_ok=True)
-            tail = (r.stdout or "")[-400:]
-            return {
-                "status": "error",
-                "detail": tail or f"systemd-run exit {r.returncode}",
-            }
-        time.sleep(1.5)
-        if not _CHK_LOG.is_file():
-            _CHK_FLAG.unlink(missing_ok=True)
-            return {"status": "error", "detail": "log not found"}
-        try:
-            log_lines = _CHK_LOG.read_text(encoding="utf-8").splitlines()
-        except OSError as e:
-            _CHK_FLAG.unlink(missing_ok=True)
-            return {"status": "error", "detail": str(e)}
-        for line in reversed(log_lines):
-            if line.startswith("update_available"):
-                parts = line.strip().split()
-                if len(parts) == 3:
-                    return {
-                        "status": "update_available",
-                        "latest": parts[1],
-                        "current": parts[2],
-                        "changelog": _fetch_github_release_changelog(),
-                    }
-            if line.startswith("up_to_date"):
-                parts = line.strip().split()
-                if len(parts) == 2:
-                    return {"status": "up_to_date", "current": parts[1]}
-        _CHK_FLAG.unlink(missing_ok=True)
-        return {"status": "error", "detail": "no update info in log"}
-    except Exception as e:
-        _CHK_FLAG.unlink(missing_ok=True)
-        return {"status": "error", "detail": str(e)}
+        current = _updater.installed(_plugin_json_path().parent)
+        release = _updater.release()
+        latest = str(release['tag_name']).removeprefix('v')
+        newer = _updater.version(latest) > _updater.version(current)
+        return dict(status='update_available' if newer else 'up_to_date', latest=latest,
+                    current=current, changelog=str(release.get('body') or '')[:16000])
+    except Exception as error:
+        error_id = _bridge.diagnostics.record_exception('check_plugin_updates', error)
+        return dict(status='error', detail=f'{error} (ID: {error_id})')
+
+
+def _status_age(result) -> float:
+    try:
+        import math
+        age = time.time() - float(result.get('updated_at', 0))
+        return age if math.isfinite(age) else float('inf')
+    except (TypeError, ValueError, OverflowError):
+        return float('inf')
+
+
+def _update_status() -> dict:
+    result = _updater.read_status(_updater.STATE)
+    if result.get('status') == 'updating' and _status_age(result) > 120:
+        import fcntl
+        with open(_updater.LOCK, 'a') as guard:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                # The queue may have changed after the optimistic read above.
+                result = _updater.read_status(_updater.STATE)
+                if result.get('status') == 'updating' and _status_age(result) > 120:
+                    result.update(status='error', detail='Update worker stopped before reporting completion. Open Diagnostics.')
+                    _updater.write_status(_updater.STATE, **result)
+    result['current_version'] = _read_local_version_fallback().get('current_version', '')
+    return result
 
 
 def _update_plugin_thread() -> str:
-    _decky_cleanup_flag(_UPD_FLAG, _UPD_UNIT)
-    if _decky_flag_busy(_UPD_FLAG):
-        return "updating"
-    _UPD_FLAG.touch()
-    script = _write_deckyzapretdpi_update_script()
+    import fcntl
+    with open(_updater.LOCK, 'a') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 'updating'
+        previous = _updater.read_status(_updater.STATE)
+        if previous.get('status') == 'updating' and _status_age(previous) < 120:
+            return 'updating'
+        _updater.write_status(_updater.STATE, status='updating', detail='Queued', current_version=_updater.installed(_plugin_json_path().parent))
+
+    # Queued state suppresses duplicate requests; worker must acquire the lock itself.
     try:
-        r = subprocess.run(
-            [
-                "systemd-run",
-                "--unit",
-                _UPD_UNIT,
-                "--service-type=oneshot",
-                "--quiet",
-                script,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=60,
-            env=_clean_env(),
-        )
-        if r.returncode != 0:
-            sudo_r = subprocess.run(
-                [
-                    "sudo",
-                    "systemd-run",
-                    "--unit",
-                    f"{_UPD_UNIT}_sudo",
-                    "--service-type=oneshot",
-                    "--quiet",
-                    script,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=60,
-                env=_clean_env(),
-            )
-            if sudo_r.returncode == 0:
-                return "update_started_with_sudo"
-            _UPD_FLAG.unlink(missing_ok=True)
-            return f"update_failed: {(sudo_r.stdout or '')[:200]}"
-        return "update_started"
-    except Exception as e:
-        _UPD_FLAG.unlink(missing_ok=True)
-        return f"update_failed: {e}"
+        # Unique unit and explicit argv avoid stale units and shell path expansion.
+        unit = _UPD_UNIT + '-' + str(time.time_ns())
+        python = '/usr/bin/python3' if pathlib.Path('/usr/bin/python3').is_file() else shutil.which('python3')
+        if not python:
+            raise RuntimeError('Python 3 interpreter is unavailable')
+        log_dir = os.environ.get('DECKY_PLUGIN_LOG_DIR', '/tmp/deckyzapretdpi')
+        command = ['systemd-run', '--unit', unit, '--service-type=oneshot', '--no-block', '--collect', '--quiet',
+                   '--setenv=DECKY_PLUGIN_LOG_DIR=' + log_dir, python, str(pathlib.Path(__file__).with_name('plugin_updater.py')),
+                   '--root', str(_plugin_json_path().parent)]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60, env=_clean_env())
+        if result.returncode:
+            raise RuntimeError((result.stderr or result.stdout or 'systemd-run failed')[-1000:])
+        return 'update_started'
+    except Exception as error:
+        error_id = _bridge.diagnostics.record_exception('update_plugin', error)
+        detail = f'{error} (ID: {error_id})'
+        _updater.write_status(_updater.STATE, status='error', detail=detail)
+        return 'update_failed: ' + detail
 
 
 class Plugin:
     async def _main(self):
-        pass
+        _bridge.diagnostics.record_event("plugin_start", "loaded", version=_read_local_version_fallback().get("current_version", ""))
 
     async def _unload(self):
         pass
@@ -1152,10 +977,10 @@ class Plugin:
                 out["toggle_message"] = "zapret_service_missing"
                 return out
             st = _service_state()
-            if st == "active":
-                _run_systemctl("stop", "zapret")
-            else:
-                _run_systemctl("start", "zapret")
+            action = "stop" if st == "active" else "start"
+            result = _run_systemctl(action, "zapret")
+            if result.returncode:
+                raise RuntimeError((result.stdout or "systemctl failed")[-1000:])
             return _collect_state()
 
         def _toggle():
@@ -1165,7 +990,7 @@ class Plugin:
             except Exception as error:
                 out = _collect_state()
                 out['toggle_ok'] = False
-                out['toggle_message'] = str(error)
+                out['toggle_message'] = str(error) + ' (ID: ' + _bridge.diagnostics.record_exception('toggle_zapret', error) + ')'
                 return out
 
         return await asyncio.to_thread(_toggle)
@@ -1323,6 +1148,12 @@ class Plugin:
 
         return await asyncio.to_thread(_do)
 
+    async def get_diagnostics(self) -> dict:
+        return await asyncio.to_thread(_bridge.diagnostics.snapshot, _MANAGER_ROOT, _plugin_json_path().parent)
+
+    async def get_plugin_update_status(self) -> dict:
+        return await asyncio.to_thread(_update_status)
+
     async def get_plugin_version(self) -> dict:
         return await asyncio.to_thread(_get_plugin_version_info_thread)
 
@@ -1348,5 +1179,20 @@ class Plugin:
     async def get_zapret_service_install_log_tail(self) -> dict:
         return await asyncio.to_thread(lambda: {"tail": _read_zapret_service_install_log_tail()})
 
+
+# Preserve existing RPC return shapes while recording otherwise uncaught failures.
+def _diagnosed_rpc(name, method):
+    async def call(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except Exception as error:
+            _bridge.diagnostics.record_exception(name, error)
+            raise
+    call.__name__ = method.__name__
+    return call
+
+for _rpc_name, _rpc_method in list(vars(Plugin).items()):
+    if not _rpc_name.startswith('_') and asyncio.iscoroutinefunction(_rpc_method):
+        setattr(Plugin, _rpc_name, _diagnosed_rpc(_rpc_name, _rpc_method))
 
 plugin = Plugin()
