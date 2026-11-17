@@ -1,6 +1,7 @@
 import { SidebarNavigation, ServerAPI } from "decky-frontend-lib";
 import AutopickerTab from "./settings/AutopickerTab";
 import InfoTab from "./settings/InfoTab";
+import DiagnosticsTab from "./settings/DiagnosticsTab";
 import UpdatesTab from "./settings/UpdatesTab";
 
 interface Props {
@@ -22,6 +23,11 @@ export default function SettingsPageRouter({ serverAPI }: Props) {
           title: ru ? "Обновление" : "Updates",
           route: "/deckyzapretdpi/settings/updates",
           content: <UpdatesTab serverAPI={serverAPI} />,
+        },
+        {
+          title: ru ? "Диагностика" : "Diagnostics",
+          route: "/deckyzapretdpi/settings/diagnostics",
+          content: <DiagnosticsTab serverAPI={serverAPI} />,
         },
         {
           title: ru ? "Информация" : "Information",

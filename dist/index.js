@@ -393,6 +393,75 @@
               window.SP_REACT.createElement(deckyFrontendLib.ButtonItem, { layout: "below", onClick: () => openExternalUrl(URL_IMMALWARE) }, "ImMALWARE (GitHub)"))));
   }
 
+  const textStyle = {
+      display: "block", width: "100%", minWidth: 0, margin: 0, padding: 0,
+      textIndent: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 13,
+  };
+  function readableLog(tail) {
+      return tail.slice(-16000).split("\n").map((line) => {
+          try {
+              const entry = JSON.parse(line);
+              if (!entry || typeof entry !== "object" || Array.isArray(entry))
+                  return line;
+              return Object.entries(entry).map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`).join("\n");
+          }
+          catch {
+              return line;
+          }
+      }).join("\n\n").slice(-16000);
+  }
+  function DiagnosticsTab({ serverAPI }) {
+      const ru = navigator.language?.toLowerCase().startsWith("ru");
+      const [data, setData] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const [error, setError] = React.useState("");
+      const refresh = async () => {
+          setBusy(true);
+          setError("");
+          setData(null);
+          try {
+              const response = await serverAPI.callPluginMethod("get_diagnostics", {});
+              if (!response.success)
+                  throw new Error("RPC get_diagnostics failed");
+              const value = response.result;
+              if (!value || !Array.isArray(value.missing_modules) || !Array.isArray(value.core_paths)
+                  || typeof value.log_tail !== "string")
+                  throw new Error("Invalid diagnostics response");
+              setData(value);
+          }
+          catch {
+              setError(ru
+                  ? "Не удалось прочитать диагностику. Повторите запрос; если ошибка сохраняется, перезапустите плагин в Decky."
+                  : "Could not read diagnostics. Try again; if this persists, restart the plugin in Decky.");
+          }
+          finally {
+              setBusy(false);
+          }
+      };
+      React.useEffect(() => { void refresh(); }, [serverAPI]);
+      const row = (text, color) => (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
+          window.SP_REACT.createElement("span", { style: { ...textStyle, color } }, text)));
+      return window.SP_REACT.createElement(deckyFrontendLib.PanelSection, null,
+          window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
+              window.SP_REACT.createElement(deckyFrontendLib.ButtonItem, { layout: "below", disabled: busy, onClick: refresh }, busy ? (ru ? "Чтение…" : "Reading…") : (ru ? "Обновить диагностику" : "Refresh diagnostics"))),
+          error ? row(error, "#e57373") : null,
+          data ? window.SP_REACT.createElement(window.SP_REACT.Fragment, null,
+              row(`${ru ? "Установленная версия плагина" : "Installed plugin version"}: ${data.plugin_version || "—"}\n${data.plugin_path || "—"}`),
+              row(`${ru ? "Версия менеджера" : "Manager version"}: ${data.manager_version || "—"}\n${data.manager_path || "—"}`),
+              row(data.missing_modules.length
+                  ? (ru ? "Менеджер несовместим: отсутствуют модули " : "Manager incompatible: missing modules ") + data.missing_modules.join(", ") +
+                      (ru ? ". Обновите или восстановите Zapret DPI Manager, затем перезапустите плагин в Decky." : ". Update or repair Zapret DPI Manager, then restart the plugin in Decky.")
+                  : (ru ? "Обязательные модули менеджера найдены. Если ошибка импорта сохраняется, перезапустите плагин в Decky." : "Required manager modules found. If an import error persists, restart the plugin in Decky."), data.missing_modules.length ? "#e57373" : undefined),
+              row(`${ru ? "Пути загруженного core" : "Loaded core paths"}:\n${data.core_paths.join("\n") || "—"}`),
+              row(data.last_error
+                  ? `${ru ? "Последний сбой" : "Last failure"}: ${data.last_error.id}\n${data.last_error.timestamp} · ${data.last_error.operation}\n${data.last_error.message}`
+                  : (ru ? "Зарегистрированных сбоев нет." : "No failures recorded.")),
+              row(`${ru ? "Файл журнала" : "Log file"}: ${data.log_path || "—"}`),
+              row(ru ? "Последние записи журнала (ограниченный фрагмент):" : "Recent log entries (bounded excerpt):"),
+              window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
+                  window.SP_REACT.createElement("pre", { style: { ...textStyle, fontFamily: "monospace", fontSize: 12, maxHeight: 420, overflow: "auto" } }, readableLog(data.log_tail) || (ru ? "Журнал пока пуст." : "Log is empty.")))) : null);
+  }
+
   const panelBodyNoIndent$1 = {
       display: "block",
       width: "100%",
@@ -408,9 +477,18 @@
       const [checkResult, setCheckResult] = React.useState(null);
       const [checkBusy, setCheckBusy] = React.useState(false);
       const [installBusy, setInstallBusy] = React.useState(false);
+      const alive = React.useRef(true);
+      const timer = React.useRef(null);
+      React.useEffect(() => {
+          alive.current = true;
+          return () => { alive.current = false; if (timer.current)
+              clearTimeout(timer.current); };
+      }, []);
       const loadLocal = React.useCallback(async () => {
           try {
               const r = await serverAPI.callPluginMethod("get_plugin_version", {});
+              if (!alive.current)
+                  return;
               if (r.success && r.result) {
                   if (r.result.ok) {
                       setLocalVer(r.result.current_version);
@@ -421,8 +499,13 @@
                       setLocalErr(r.result.error || r.result.error_code || "error");
                   }
               }
+              else {
+                  setLocalErr(ru ? "Не удалось прочитать версию" : "Could not read version");
+              }
           }
           catch {
+              if (!alive.current)
+                  return;
               setLocalVer("");
               setLocalErr(ru ? "Не удалось прочитать версию" : "Could not read version");
           }
@@ -456,40 +539,80 @@
               setCheckBusy(false);
           }
       };
-      const runInstall = async () => {
-          setInstallBusy(true);
+      const pollInstall = async (attempt = 0) => {
+          if (!alive.current)
+              return;
           try {
-              const r = await serverAPI.callPluginMethod("update_plugin", {});
-              if (r.success && r.result?.status) {
-                  const s = r.result.status;
-                  if (s === "update_started" || s === "update_started_with_sudo") {
-                      serverAPI.toaster.toast({
-                          title: ru ? "Zapret DPI" : "Zapret DPI",
-                          body: ru
-                              ? "Обновление запущено. Плагин скоро перезапустится."
-                              : "Update started. The plugin will restart shortly.",
-                      });
-                  }
-                  else if (s.startsWith("update_failed")) {
-                      setCheckResult((prev) => ({
-                          status: "error",
-                          detail: s,
-                          latest: prev?.latest,
-                          current: prev?.current,
-                      }));
-                  }
+              const r = await serverAPI.callPluginMethod("get_plugin_update_status", {});
+              if (!alive.current)
+                  return;
+              if (!r.success || !r.result)
+                  throw new Error("Backend reloading");
+              if (r.result.status === "updated") {
+                  await loadLocal();
+                  if (!alive.current)
+                      return;
+                  setInstallBusy(false);
+                  setCheckResult({ status: "up_to_date", current: r.result.current_version });
+                  return;
+              }
+              if (r.result.status === "error") {
+                  await loadLocal();
+                  if (!alive.current)
+                      return;
+                  setInstallBusy(false);
+                  setCheckResult({ status: "error", detail: r.result.detail });
+                  return;
               }
           }
-          catch (e) {
-              setCheckResult((prev) => ({
-                  status: "error",
-                  detail: String(e),
-                  latest: prev?.latest,
-                  current: prev?.current,
-              }));
-          }
-          finally {
+          catch { /* The loader may be restarting; bounded retries below. */ }
+          if (!alive.current)
+              return;
+          if (attempt >= 90) {
               setInstallBusy(false);
+              setCheckResult({ status: "error", detail: ru ? "Не удалось получить результат. Откройте Диагностику." : "Could not retrieve update result. Open Diagnostics." });
+              return;
+          }
+          timer.current = setTimeout(() => void pollInstall(attempt + 1), 2000);
+      };
+      React.useEffect(() => {
+          void serverAPI.callPluginMethod("get_plugin_update_status", {}).then(r => {
+              if (alive.current && r.success && r.result?.status === "updating") {
+                  setInstallBusy(true);
+                  void pollInstall();
+              }
+          }).catch(() => { });
+          // Resume an in-flight update when this tab opens again.
+      }, [serverAPI]);
+      const runInstall = async () => {
+          setInstallBusy(true);
+          let acknowledgedFailure = false;
+          try {
+              const r = await serverAPI.callPluginMethod("update_plugin", {});
+              if (!alive.current)
+                  return;
+              if (!r.success || !r.result?.status) {
+                  acknowledgedFailure = true;
+                  throw new Error(ru ? "Не удалось запустить обновление" : "Could not start update");
+              }
+              const status = r.result.status;
+              if (!["update_started", "update_started_with_sudo", "updating"].includes(status)) {
+                  acknowledgedFailure = true;
+                  throw new Error(status);
+              }
+              setCheckResult({ status: "checking", detail: ru ? "Обновление запущено" : "Update queued" });
+              void pollInstall();
+          }
+          catch (error) {
+              if (!alive.current)
+                  return;
+              if (!acknowledgedFailure) {
+                  // Worker may restart the loader before the launch acknowledgement arrives.
+                  void pollInstall();
+                  return;
+              }
+              setInstallBusy(false);
+              setCheckResult({ status: "error", detail: String(error) });
           }
       };
       const onPrimaryClick = () => {
@@ -516,7 +639,7 @@
           if (checkResult.status === "checking")
               return ru ? "Проверка…" : "Checking…";
           if (checkResult.status === "error") {
-              return `${ru ? "Ошибка" : "Error"}: ${checkResult.detail || ""}`;
+              return `${ru ? "Ошибка" : "Error"}: ${checkResult.detail || ""}\n${ru ? "Подробности: вкладка «Диагностика»." : "Details: Diagnostics tab."}`;
           }
           if (checkResult.status === "up_to_date") {
               return ru
@@ -575,6 +698,11 @@
                   content: window.SP_REACT.createElement(UpdatesTab, { serverAPI: serverAPI }),
               },
               {
+                  title: ru ? "Диагностика" : "Diagnostics",
+                  route: "/deckyzapretdpi/settings/diagnostics",
+                  content: window.SP_REACT.createElement(DiagnosticsTab, { serverAPI: serverAPI }),
+              },
+              {
                   title: ru ? "Информация" : "Information",
                   route: "/deckyzapretdpi/settings/info",
                   content: window.SP_REACT.createElement(InfoTab, { serverAPI: serverAPI }),
@@ -628,6 +756,16 @@
       };
       return (ru ? ruMap : enMap)[active] ?? (ru ? ruMap.unknown : enMap.unknown);
   }
+  function diagnosticErrorText(ru, code) {
+      const id = code.match(/(?:\bID:\s*|error_id[=: ]+)([A-Za-z0-9_-]+)/i)?.[1];
+      const missing = code.match(/(?:No module named |missing module[: ]+)[\'"]?([\w.]+)/i)?.[1];
+      const detail = missing
+          ? (ru ? `Отсутствует модуль ${missing}. Обновите или восстановите менеджер и перезапустите плагин.`
+              : `Module ${missing} is missing. Update or repair the manager and restart the plugin.`)
+          : (ru ? "Операция не выполнена. Откройте настройки → Диагностика для подробностей."
+              : "Operation failed. Open settings → Diagnostics for details.");
+      return detail + (id ? ` ID: ${id}` : "");
+  }
   function applyErrorText(ru, code) {
       const ruM = {
           invalid_name: "Некорректное имя стратегии",
@@ -644,7 +782,7 @@
           return m[code];
       if (code === "systemctl failed")
           return ru ? "Не удалось перезапустить службу" : "Could not restart service";
-      return code.length > 80 ? code.slice(0, 80) + "…" : code;
+      return diagnosticErrorText(ru, code);
   }
   function gamePresetErrorText(ru, code) {
       const ruM = {
@@ -662,7 +800,7 @@
           return m[code];
       if (code === "systemctl failed")
           return ru ? "Не удалось перезапустить службу" : "Could not restart service";
-      return code.length > 80 ? code.slice(0, 80) + "…" : code;
+      return diagnosticErrorText(ru, code);
   }
   function gameFilterProtocolSuffix(ru, m) {
       const mode = (m || "both").toLowerCase();
@@ -699,7 +837,7 @@
           return m[code];
       if (code === "systemctl failed")
           return ru ? "Не удалось перезапустить службу" : "Could not restart service";
-      return code.length > 80 ? code.slice(0, 80) + "…" : code;
+      return diagnosticErrorText(ru, code);
   }
   const NONE_PRESET = "none";
   /** Совпадает с preset_id в game_presets.py менеджера; текст окна только в плагине. */
@@ -920,7 +1058,17 @@
       const refresh = async () => {
           try {
               const [nextState, presetsRes] = await Promise.all([get_zapret_state(), list_game_presets()]);
-              setState(nextState);
+              setState((previous) => {
+                  // Polling must not erase an action failure before it can be read.
+                  const next = { ...nextState };
+                  for (const [ok, message] of [["toggle_ok", "toggle_message"], ["apply_ok", "apply_message"], ["gamefilter_ok", "gamefilter_message"], ["ipset_ok", "ipset_message"]]) {
+                      if (previous?.[ok] === false && next[ok] == null) {
+                          next[ok] = false;
+                          next[message] = previous[message];
+                      }
+                  }
+                  return next;
+              });
               setGamePresets(presetsRes.presets ?? []);
           }
           catch {
@@ -1030,11 +1178,11 @@
           setGfBusy(true);
           toggle_gamefilter({})
               .then(setState)
-              .catch(() => setState((prev) => prev
+              .catch((error) => setState((prev) => prev
               ? {
                   ...prev,
                   gamefilter_ok: false,
-                  gamefilter_message: ru ? "Ошибка переключения GameFilter" : "GameFilter toggle failed",
+                  gamefilter_message: String(error),
               }
               : prev))
               .finally(() => setGfBusy(false));
@@ -1043,11 +1191,11 @@
           setGfBusy(true);
           toggle_gamefilter({ protocol_mode: mode })
               .then(setState)
-              .catch(() => setState((prev) => prev
+              .catch((error) => setState((prev) => prev
               ? {
                   ...prev,
                   gamefilter_ok: false,
-                  gamefilter_message: ru ? "Ошибка переключения GameFilter" : "GameFilter toggle failed",
+                  gamefilter_message: String(error),
               }
               : prev))
               .finally(() => setGfBusy(false));
@@ -1084,6 +1232,11 @@
                       try {
                           setState(await toggle_zapret());
                       }
+                      catch (error) {
+                          setState((previous) => previous ? {
+                              ...previous, toggle_ok: false, toggle_message: String(error),
+                          } : previous);
+                      }
                       finally {
                           setBusy(false);
                       }
@@ -1096,6 +1249,10 @@
                       : "Enable Zapret DPI")),
           window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
               window.SP_REACT.createElement("div", { style: { height: 8 } })),
+          state?.toggle_message != null && state.toggle_ok === false ? (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
+              window.SP_REACT.createElement("span", { style: { ...panelBodyNoIndent, fontSize: 12, color: "#e57373" } }, state.toggle_message === "zapret_service_missing"
+                  ? (ru ? "Служба Zapret не установлена. Откройте настройки менеджера." : "Zapret service is not installed. Open the manager settings.")
+                  : diagnosticErrorText(ru, state.toggle_message)))) : null,
           state?.apply_message != null && state.apply_ok === false ? (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
               window.SP_REACT.createElement("span", { style: { ...panelBodyNoIndent, fontSize: 12, color: "#e57373" } }, applyErrorText(ru, state.apply_message)))) : null,
           state?.apply_ok === true ? (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
@@ -1114,12 +1271,12 @@
                           const next = await apply_working_strategy(name);
                           setState(next);
                       }
-                      catch {
+                      catch (error) {
                           setState((prev) => prev
                               ? {
                                   ...prev,
                                   apply_ok: false,
-                                  apply_message: ru ? "Ошибка применения" : "Apply failed",
+                                  apply_message: String(error),
                               }
                               : prev);
                       }
@@ -1166,12 +1323,12 @@
                               : await set_gamefilter_protocol_mode(raw);
                           setState(next);
                       }
-                      catch {
+                      catch (error) {
                           setState((prev) => prev
                               ? {
                                   ...prev,
                                   gamefilter_ok: false,
-                                  gamefilter_message: ru ? "Не удалось сменить режим" : "Could not change mode",
+                                  gamefilter_message: String(error),
                               }
                               : prev);
                       }
@@ -1203,12 +1360,12 @@
                           const next = await set_game_preset(preset_id);
                           setState(next);
                       }
-                      catch {
+                      catch (error) {
                           setState((prev) => prev
                               ? {
                                   ...prev,
                                   gamefilter_ok: false,
-                                  gamefilter_message: ru ? "Ошибка применения пресета" : "Preset apply failed",
+                                  gamefilter_message: String(error),
                               }
                               : prev);
                       }
@@ -1238,12 +1395,12 @@
                           const next = await set_ipset_filter_mode(mode);
                           setState(next);
                       }
-                      catch {
+                      catch (error) {
                           setState((prev) => prev
                               ? {
                                   ...prev,
                                   ipset_ok: false,
-                                  ipset_message: ru ? "Ошибка применения IPset" : "IPset apply failed",
+                                  ipset_message: String(error),
                               }
                               : prev);
                       }

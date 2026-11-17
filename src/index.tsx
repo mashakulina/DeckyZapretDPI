@@ -40,6 +40,8 @@ export type ZapretState = {
   manager_installed?: boolean;
   zapret_service_installed?: boolean;
   working_strategies: string[];
+  toggle_ok?: boolean;
+  toggle_message?: string;
   apply_ok?: boolean;
   apply_message?: string;
   gamefilter_enabled?: boolean;
@@ -103,6 +105,17 @@ function serviceStatusText(ru: boolean, active: string): string {
   return (ru ? ruMap : enMap)[active] ?? (ru ? ruMap.unknown : enMap.unknown);
 }
 
+function diagnosticErrorText(ru: boolean, code: string): string {
+  const id = code.match(/(?:\bID:\s*|error_id[=: ]+)([A-Za-z0-9_-]+)/i)?.[1];
+  const missing = code.match(/(?:No module named |missing module[: ]+)[\'"]?([\w.]+)/i)?.[1];
+  const detail = missing
+    ? (ru ? `Отсутствует модуль ${missing}. Обновите или восстановите менеджер и перезапустите плагин.`
+      : `Module ${missing} is missing. Update or repair the manager and restart the plugin.`)
+    : (ru ? "Операция не выполнена. Откройте настройки → Диагностика для подробностей."
+      : "Operation failed. Open settings → Diagnostics for details.");
+  return detail + (id ? ` ID: ${id}` : "");
+}
+
 function applyErrorText(ru: boolean, code: string): string {
   const ruM: Record<string, string> = {
     invalid_name: "Некорректное имя стратегии",
@@ -117,7 +130,7 @@ function applyErrorText(ru: boolean, code: string): string {
   const m = ru ? ruM : enM;
   if (code in m) return m[code];
   if (code === "systemctl failed") return ru ? "Не удалось перезапустить службу" : "Could not restart service";
-  return code.length > 80 ? code.slice(0, 80) + "…" : code;
+  return diagnosticErrorText(ru, code);
 }
 
 function gamePresetErrorText(ru: boolean, code: string): string {
@@ -134,7 +147,7 @@ function gamePresetErrorText(ru: boolean, code: string): string {
   const m = ru ? ruM : enM;
   if (code in m) return m[code];
   if (code === "systemctl failed") return ru ? "Не удалось перезапустить службу" : "Could not restart service";
-  return code.length > 80 ? code.slice(0, 80) + "…" : code;
+  return diagnosticErrorText(ru, code);
 }
 
 function gameFilterProtocolSuffix(ru: boolean, m: string | undefined): string {
@@ -169,7 +182,7 @@ function ipsetErrorText(ru: boolean, code: string): string {
   const m = ru ? ruM : enM;
   if (code in m) return m[code];
   if (code === "systemctl failed") return ru ? "Не удалось перезапустить службу" : "Could not restart service";
-  return code.length > 80 ? code.slice(0, 80) + "…" : code;
+  return diagnosticErrorText(ru, code);
 }
 
 const NONE_PRESET = "none";
@@ -462,7 +475,17 @@ const Content = () => {
   const refresh = async () => {
     try {
       const [nextState, presetsRes] = await Promise.all([get_zapret_state(), list_game_presets()]);
-      setState(nextState);
+      setState((previous) => {
+        // Polling must not erase an action failure before it can be read.
+        const next = { ...nextState };
+        for (const [ok, message] of [["toggle_ok", "toggle_message"], ["apply_ok", "apply_message"], ["gamefilter_ok", "gamefilter_message"], ["ipset_ok", "ipset_message"]] as const) {
+          if (previous?.[ok] === false && next[ok] == null) {
+            next[ok] = false;
+            next[message] = previous[message];
+          }
+        }
+        return next;
+      });
       setGamePresets(presetsRes.presets ?? []);
     } catch {
       setState({
@@ -590,13 +613,13 @@ const Content = () => {
     setGfBusy(true);
     toggle_gamefilter({})
       .then(setState)
-      .catch(() =>
+      .catch((error) =>
         setState((prev) =>
           prev
             ? {
                 ...prev,
                 gamefilter_ok: false,
-                gamefilter_message: ru ? "Ошибка переключения GameFilter" : "GameFilter toggle failed",
+                gamefilter_message: String(error),
               }
             : prev,
         ),
@@ -608,13 +631,13 @@ const Content = () => {
     setGfBusy(true);
     toggle_gamefilter({ protocol_mode: mode })
       .then(setState)
-      .catch(() =>
+      .catch((error) =>
         setState((prev) =>
           prev
             ? {
                 ...prev,
                 gamefilter_ok: false,
-                gamefilter_message: ru ? "Ошибка переключения GameFilter" : "GameFilter toggle failed",
+                gamefilter_message: String(error),
               }
             : prev,
         ),
@@ -679,6 +702,10 @@ const Content = () => {
             setBusy(true);
             try {
               setState(await toggle_zapret());
+            } catch (error) {
+              setState((previous) => previous ? {
+                ...previous, toggle_ok: false, toggle_message: String(error),
+              } : previous);
             } finally {
               setBusy(false);
             }
@@ -696,6 +723,15 @@ const Content = () => {
       <PanelSectionRow>
         <div style={{ height: 8 }} />
       </PanelSectionRow>
+      {state?.toggle_message != null && state.toggle_ok === false ? (
+        <PanelSectionRow>
+          <span style={{ ...panelBodyNoIndent, fontSize: 12, color: "#e57373" }}>
+            {state.toggle_message === "zapret_service_missing"
+              ? (ru ? "Служба Zapret не установлена. Откройте настройки менеджера." : "Zapret service is not installed. Open the manager settings.")
+              : diagnosticErrorText(ru, state.toggle_message)}
+          </span>
+        </PanelSectionRow>
+      ) : null}
       {state?.apply_message != null && state.apply_ok === false ? (
         <PanelSectionRow>
           <span style={{ ...panelBodyNoIndent, fontSize: 12, color: "#e57373" }}>
@@ -741,13 +777,13 @@ const Content = () => {
               try {
                 const next = await apply_working_strategy(name);
                 setState(next);
-              } catch {
+              } catch (error) {
                 setState((prev) =>
                   prev
                     ? {
                         ...prev,
                         apply_ok: false,
-                        apply_message: ru ? "Ошибка применения" : "Apply failed",
+                        apply_message: String(error),
                       }
                     : prev,
                 );
@@ -806,13 +842,13 @@ const Content = () => {
                   })
                 : await set_gamefilter_protocol_mode(raw);
               setState(next);
-            } catch {
+            } catch (error) {
               setState((prev) =>
                 prev
                   ? {
                       ...prev,
                       gamefilter_ok: false,
-                      gamefilter_message: ru ? "Не удалось сменить режим" : "Could not change mode",
+                      gamefilter_message: String(error),
                     }
                   : prev,
               );
@@ -855,13 +891,13 @@ const Content = () => {
               }
               const next = await set_game_preset(preset_id);
               setState(next);
-            } catch {
+            } catch (error) {
               setState((prev) =>
                 prev
                   ? {
                       ...prev,
                       gamefilter_ok: false,
-                      gamefilter_message: ru ? "Ошибка применения пресета" : "Preset apply failed",
+                      gamefilter_message: String(error),
                     }
                   : prev,
               );
@@ -907,13 +943,13 @@ const Content = () => {
             try {
               const next = await set_ipset_filter_mode(mode);
               setState(next);
-            } catch {
+            } catch (error) {
               setState((prev) =>
                 prev
                   ? {
                       ...prev,
                       ipset_ok: false,
-                      ipset_message: ru ? "Ошибка применения IPset" : "IPset apply failed",
+                      ipset_message: String(error),
                     }
                   : prev,
               );

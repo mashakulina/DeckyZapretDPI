@@ -1,5 +1,5 @@
 import { ButtonItem, PanelSection, PanelSectionRow, ServerAPI } from "decky-frontend-lib";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 const panelBodyNoIndent: CSSProperties = {
@@ -42,10 +42,17 @@ export default function UpdatesTab({ serverAPI }: Props) {
   const [checkResult, setCheckResult] = useState<PluginUpdateCheckResult | null>(null);
   const [checkBusy, setCheckBusy] = useState(false);
   const [installBusy, setInstallBusy] = useState(false);
+  const alive = useRef(true);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; if (timer.current) clearTimeout(timer.current); };
+  }, []);
 
   const loadLocal = useCallback(async () => {
     try {
       const r = await serverAPI.callPluginMethod<{}, VersionInfo>("get_plugin_version", {});
+      if (!alive.current) return;
       if (r.success && r.result) {
         if (r.result.ok) {
           setLocalVer(r.result.current_version);
@@ -54,8 +61,11 @@ export default function UpdatesTab({ serverAPI }: Props) {
           setLocalVer("");
           setLocalErr(r.result.error || r.result.error_code || "error");
         }
+      } else {
+        setLocalErr(ru ? "Не удалось прочитать версию" : "Could not read version");
       }
     } catch {
+      if (!alive.current) return;
       setLocalVer("");
       setLocalErr(ru ? "Не удалось прочитать версию" : "Could not read version");
     }
@@ -89,37 +99,66 @@ export default function UpdatesTab({ serverAPI }: Props) {
     }
   };
 
+  const pollInstall = async (attempt = 0): Promise<void> => {
+    if (!alive.current) return;
+    try {
+      const r = await serverAPI.callPluginMethod<{}, { status: string; detail?: string; current_version?: string }>("get_plugin_update_status", {});
+      if (!alive.current) return;
+      if (!r.success || !r.result) throw new Error("Backend reloading");
+      if (r.result.status === "updated") {
+        await loadLocal();
+        if (!alive.current) return;
+        setInstallBusy(false);
+        setCheckResult({ status: "up_to_date", current: r.result.current_version });
+        return;
+      }
+      if (r.result.status === "error") {
+        await loadLocal();
+        if (!alive.current) return;
+        setInstallBusy(false);
+        setCheckResult({ status: "error", detail: r.result.detail });
+        return;
+      }
+    } catch { /* The loader may be restarting; bounded retries below. */ }
+    if (!alive.current) return;
+    if (attempt >= 90) {
+      setInstallBusy(false);
+      setCheckResult({ status: "error", detail: ru ? "Не удалось получить результат. Откройте Диагностику." : "Could not retrieve update result. Open Diagnostics." });
+      return;
+    }
+    timer.current = setTimeout(() => void pollInstall(attempt + 1), 2000);
+  };
+
+  useEffect(() => {
+    void serverAPI.callPluginMethod<{}, UpdatePluginResult>("get_plugin_update_status", {}).then(r => {
+      if (alive.current && r.success && r.result?.status === "updating") {
+        setInstallBusy(true);
+        void pollInstall();
+      }
+    }).catch(() => { /* A fresh version read already exposes connection errors. */ });
+    // Resume an in-flight update when this tab opens again.
+  }, [serverAPI]);
+
   const runInstall = async () => {
     setInstallBusy(true);
+    let acknowledgedFailure = false;
     try {
       const r = await serverAPI.callPluginMethod<{}, UpdatePluginResult>("update_plugin", {});
-      if (r.success && r.result?.status) {
-        const s = r.result.status;
-        if (s === "update_started" || s === "update_started_with_sudo") {
-          serverAPI.toaster.toast({
-            title: ru ? "Zapret DPI" : "Zapret DPI",
-            body: ru
-              ? "Обновление запущено. Плагин скоро перезапустится."
-              : "Update started. The plugin will restart shortly.",
-          });
-        } else if (s.startsWith("update_failed")) {
-          setCheckResult((prev) => ({
-            status: "error",
-            detail: s,
-            latest: prev?.latest,
-            current: prev?.current,
-          }));
-        }
+      if (!alive.current) return;
+      if (!r.success || !r.result?.status) { acknowledgedFailure = true; throw new Error(ru ? "Не удалось запустить обновление" : "Could not start update"); }
+      const status = r.result.status;
+      if (!["update_started", "update_started_with_sudo", "updating"].includes(status)) { acknowledgedFailure = true; throw new Error(status); }
+      setCheckResult({ status: "checking", detail: ru ? "Обновление запущено" : "Update queued" });
+      void pollInstall();
+    } catch (error) {
+      if (!alive.current) return;
+      if (!acknowledgedFailure) {
+        // Worker may restart the loader before the launch acknowledgement arrives.
+        void pollInstall();
+        return;
       }
-    } catch (e) {
-      setCheckResult((prev) => ({
-        status: "error",
-        detail: String(e),
-        latest: prev?.latest,
-        current: prev?.current,
-      }));
-    } finally {
       setInstallBusy(false);
+      setCheckResult({ status: "error", detail: String(error) });
     }
   };
 
@@ -144,7 +183,7 @@ export default function UpdatesTab({ serverAPI }: Props) {
     if (!checkResult) return "";
     if (checkResult.status === "checking") return ru ? "Проверка…" : "Checking…";
     if (checkResult.status === "error") {
-      return `${ru ? "Ошибка" : "Error"}: ${checkResult.detail || ""}`;
+      return `${ru ? "Ошибка" : "Error"}: ${checkResult.detail || ""}\n${ru ? "Подробности: вкладка «Диагностика»." : "Details: Diagnostics tab."}`;
     }
     if (checkResult.status === "up_to_date") {
       return ru
