@@ -15,8 +15,7 @@ import threading
 
 # main and autopicker load this bridge by file path under different names.
 # A stable registry key keeps diagnostics/handlers shared across those imports.
-def _load_diagnostics():
-    key = '_decky_zapret_plugin_diagnostics'
+def _load_shared(filename, key):
     # Only reserve the shared mutex under Python's global import lock. Do not
     # hold that lock while executing code which may import other modules.
     _imp.acquire_lock()
@@ -31,7 +30,7 @@ def _load_diagnostics():
     with state.lock:
         module = sys.modules.get(key)
         if module is None:
-            spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name('plugin_diagnostics.py'))
+            spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name(filename))
             module = importlib.util.module_from_spec(spec)
             sys.modules[key] = module
             try:
@@ -42,7 +41,8 @@ def _load_diagnostics():
         return module
 
 
-diagnostics = _load_diagnostics()
+diagnostics = _load_shared('plugin_diagnostics.py', '_decky_zapret_plugin_diagnostics')
+compat = _load_shared('manager_compat.py', '_decky_zapret_manager_compat')
 
 
 _operation_name = ContextVar('decky_manager_operation', default='manager.import')
@@ -63,7 +63,7 @@ def _inside(path, directory):
     return Path(path).resolve().is_relative_to(directory)
 
 
-def manager_module(root, name, operation_name=None):
+def manager_module(root, name, operation_name=None, optional=False):
     root = Path(root).resolve()
     directory = root / 'core'
     try:
@@ -96,6 +96,8 @@ def manager_module(root, name, operation_name=None):
             importlib.invalidate_caches()
             already_loaded = 'core.' + name in sys.modules
             import_spec = importlib.util.find_spec('core.' + name)
+            if import_spec is None and optional:
+                return None
             if import_spec and import_spec.origin and not _inside(import_spec.origin, directory):
                 raise RuntimeError(f'Модуль core.{name} ({import_spec.origin}) находится в другом каталоге; восстановите менеджер и перезапустите плагин.')
             module = importlib.import_module('core.' + name)
@@ -127,7 +129,7 @@ def normalize_changed_ownership(root, before):
     if os.geteuid() != 0:
         return
     owner = root.stat()
-    paths = manager_module(root, 'custom_game_presets')._switch_paths(root)
+    paths = manager_switch_paths(root)
     for path in paths:
         if not path.is_symlink() and path.is_file() and before.get(path) != path.read_bytes():
             os.chown(path, owner.st_uid, owner.st_gid)
@@ -137,14 +139,83 @@ def normalize_changed_ownership(root, before):
             os.chown(directory, owner.st_uid, owner.st_gid)
 
 
+def manager_switch_paths(root):
+    root = Path(root)
+    paths = set(manager_module(root, 'custom_game_presets')._switch_paths(root))
+    # The stable manager does not know about the plugin's built-in list journal.
+    paths.add(root / 'utils/builtin_game_lists.state.json')
+    return paths
+
+
+def manager_settings_lock(root):
+    module = manager_module(root, 'config_lock', optional=True)
+    lock = module.manager_settings_lock if module is not None else compat.manager_settings_lock
+    return lock(root)
+
+
+def game_operation(root, name, *args):
+    if name not in ('apply_game_preset_disk', 'toggle_gamefilter_disk', 'set_gamefilter_mode_disk'):
+        raise ValueError('Unknown game operation')
+    module = manager_module(root, 'game_mode', optional=True)
+    operation = getattr(module, name) if module is not None else getattr(compat.GameOperations(root, manager_module), name)
+    return operation(str(root), *args)
+
+
+def validate_payloads(root, content, operation_name=None):
+    module = manager_module(root, 'strategy_payloads', operation_name=operation_name, optional=True)
+    validate = module.validate_payloads if module is not None else compat.validate_payloads
+    return validate(content, root)
+
+
+@contextmanager
+def _fallback_strategy_change(root, restart):
+    custom = manager_module(root, 'custom_game_presets')
+    before = {path: custom._read(path) for path in manager_switch_paths(root)}
+    metadata = {path: path.stat() for path, data in before.items() if data is not None}
+    attempted = False
+    try:
+        yield
+        validate_payloads(root, (root / 'config.txt').read_text(encoding='utf-8-sig'))
+        if restart is not None:
+            attempted = True
+            success, message = restart()
+            if not success:
+                raise RuntimeError(message or 'Не удалось запустить новую стратегию.')
+    except Exception as error:
+        try:
+            # Include newly created preset markers, not just the initial set.
+            custom._commit({path: before.get(path) for path in set(before) | manager_switch_paths(root)})
+            # Stable _commit replaces files via temporary files. Restore metadata
+            # even when restored bytes compare equal (including nested rollback).
+            for path, info in metadata.items():
+                if os.geteuid() == 0:
+                    os.chown(path, info.st_uid, info.st_gid)
+                os.chmod(path, info.st_mode & 0o777)
+        except Exception as rollback_error:
+            raise RuntimeError(f'{error}; не удалось восстановить прежние настройки: {rollback_error}') from rollback_error
+        if attempted:
+            try:
+                validate_payloads(root, (root / 'config.txt').read_text(encoding='utf-8-sig'))
+                success, message = restart()
+                if not success:
+                    raise RuntimeError(message)
+            except Exception as restore_error:
+                raise RuntimeError(f'{error}; прежние настройки восстановлены, но восстановить запуск не удалось: {restore_error}') from restore_error
+            raise RuntimeError(f'{error}; прежние настройки и запуск восстановлены.') from error
+        raise
+
+
 @contextmanager
 def manager_change(root, restart=None):
     root = Path(root).resolve()
-    with manager_module(root, 'config_lock').manager_settings_lock(root):
-        paths = manager_module(root, 'custom_game_presets')._switch_paths(root)
+    with manager_settings_lock(root):
+        paths = manager_switch_paths(root)
         before = _snapshot(paths)
+        settings = manager_module(root, 'strategy_settings')
+        native_change = getattr(settings, 'strategy_change', None) if settings is not None else None
+        change = native_change(root, restart=restart) if native_change is not None else _fallback_strategy_change(root, restart)
         try:
-            with manager_module(root, 'strategy_settings').strategy_change(root, restart=restart):
+            with change:
                 yield
                 normalize_changed_ownership(root, before)
         except Exception as error:
@@ -185,7 +256,7 @@ def apply_strategy(root, strategy_name, restart, operation_name="manager.apply_s
     if not content:
         return False, 'Пустой config не применён.'
     try:
-        manager_module(root, 'strategy_payloads', operation_name=operation_name).validate_payloads(content, root)
+        validate_payloads(root, content, operation_name=operation_name)
     except Exception as error:
         return False, _failure(operation_name, error, root, phase="validate")
     def save():

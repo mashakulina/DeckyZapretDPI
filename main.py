@@ -405,11 +405,11 @@ def _list_game_presets_dicts() -> list[dict[str, str]]:
 def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tuple[bool, str]:
     clear = not preset_id or str(preset_id).strip().lower() in ("", "none", "null")
     pid = None if clear else str(preset_id).strip()
-    return _bridge.mutate(manager, lambda: _bridge.manager_module(manager, 'game_mode').apply_game_preset_disk(str(manager), pid), _restart_zapret_service)
+    return _bridge.mutate(manager, lambda: _bridge.game_operation(manager, 'apply_game_preset_disk', pid), _restart_zapret_service)
 
 
 def _toggle_gamefilter_impl(manager: pathlib.Path, protocol_mode: Optional[str] = None) -> tuple[bool, str]:
-    return _bridge.mutate(manager, lambda: _bridge.manager_module(manager, 'game_mode').toggle_gamefilter_disk(str(manager), protocol_mode), _restart_zapret_service)
+    return _bridge.mutate(manager, lambda: _bridge.game_operation(manager, 'toggle_gamefilter_disk', protocol_mode), _restart_zapret_service)
 
 
 def _gamefilter_ports_state(manager: pathlib.Path) -> dict:
@@ -464,7 +464,7 @@ def _set_gamefilter_ports_impl(manager: pathlib.Path, mode: Any, ports: Any,
 
 
 def _set_gamefilter_protocol_mode_impl(manager: pathlib.Path, mode: str) -> tuple[bool, str]:
-    return _bridge.mutate(manager, lambda: _bridge.manager_module(manager, 'game_mode').set_gamefilter_mode_disk(str(manager), mode), _restart_zapret_service)
+    return _bridge.mutate(manager, lambda: _bridge.game_operation(manager, 'set_gamefilter_mode_disk', mode), _restart_zapret_service)
 
 
 _IPSET_NONE_MARKER = "203.0.113.113/32"
@@ -985,7 +985,7 @@ class Plugin:
 
         def _toggle():
             try:
-                with _bridge.manager_module(_MANAGER_ROOT, 'config_lock').manager_settings_lock(_MANAGER_ROOT):
+                with _bridge.manager_settings_lock(_MANAGER_ROOT):
                     return _perform_toggle()
             except Exception as error:
                 out = _collect_state()

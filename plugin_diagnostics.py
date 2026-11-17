@@ -17,8 +17,9 @@ import uuid
 MAX_BYTES = 256 * 1024
 BACKUP_COUNT = 2
 MAX_TAIL = 32000
-REQUIRED_MODULES = ('config_lock', 'custom_game_presets', 'strategy_settings',
-                    'strategy_payloads', 'game_presets', 'game_mode',
+# Stable 2.8.0 lacks config_lock, game_mode and strategy_payloads. The plugin
+# supplies those helpers when absent; only manager-owned dependencies are required.
+REQUIRED_MODULES = ('custom_game_presets', 'strategy_settings', 'game_presets',
                     'game_filter_settings', 'game_filter_ports', 'manager_config',
                     'zapret_updater', 'strategy_import', 'strategy_paths', 'game_filter_extras')
 _lock = threading.RLock()

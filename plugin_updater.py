@@ -17,7 +17,7 @@ import zipfile
 API = 'https://api.github.com/repos/mashakulina/DeckyZapretDPI/releases/latest'
 STATE = Path('/tmp/deckyzapretdpi-update-state.json')
 LOCK = Path('/tmp/deckyzapretdpi-update.lock')
-REQUIRED = ('main.py', 'decky_autopicker.py', 'manager_bridge.py', 'plugin_diagnostics.py', 'plugin_updater.py', 'plugin.json', 'package.json', 'dist/index.js')
+REQUIRED = ('main.py', 'decky_autopicker.py', 'manager_bridge.py', 'manager_compat.py', 'plugin_diagnostics.py', 'plugin_updater.py', 'plugin.json', 'package.json', 'dist/index.js')
 
 
 def version(value):
