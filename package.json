@@ -1,12 +1,18 @@
 {
   "name": "decky-zapretdpi",
   "version": "1.0.6",
-  "description": "Decky plugin for Zapret DPI Manager — service toggle and status",
+  "description": "Decky plugin for Zapret DPI Manager \u2014 service toggle and status",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",
-    "watch": "rollup -c -w"
+    "watch": "rollup -c -w",
+    "typecheck": "tsc --noEmit"
   },
-  "keywords": ["decky", "plugin", "zapret", "steam-deck"],
+  "keywords": [
+    "decky",
+    "plugin",
+    "zapret",
+    "steam-deck"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@rollup/plugin-commonjs": "^21.1.0",
@@ -14,6 +20,7 @@
     "@rollup/plugin-node-resolve": "^13.3.0",
     "@rollup/plugin-replace": "^4.0.0",
     "@rollup/plugin-typescript": "^8.5.0",
+    "@types/node": "18.19.0",
     "@types/react": "16.14.0",
     "rollup": "^2.79.2",
     "rollup-plugin-import-assets": "^1.1.1",
@@ -27,7 +34,10 @@
   },
   "pnpm": {
     "peerDependencyRules": {
-      "ignoreMissing": ["react", "react-dom"]
+      "ignoreMissing": [
+        "react",
+        "react-dom"
+      ]
     }
   }
 }

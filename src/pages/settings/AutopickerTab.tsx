@@ -50,7 +50,7 @@ export default function AutopickerTab({ serverAPI }: Props) {
 
   const loadNames = async () => {
     try {
-      const r = await serverAPI.callPluginMethod<{ strategies: string[] }, { strategies: string[] }>(
+      const r = await serverAPI.callPluginMethod<{}, { strategies: string[] }>(
         "list_strategy_files",
         {},
       );

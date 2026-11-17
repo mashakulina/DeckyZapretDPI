@@ -16,6 +16,7 @@ import { FaShieldAlt } from "react-icons/fa";
 import { BsGearFill } from "react-icons/bs";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { GameFilterPorts } from "./components/GameFilterPorts";
 import SettingsPageRouter from "./pages/SettingsPageRouter";
 
 /** Сброс абзацного отступа у поясняющего текста в строках панели. */
@@ -26,6 +27,8 @@ const panelBodyNoIndent: CSSProperties = {
   padding: 0,
   textIndent: 0,
   boxSizing: "border-box",
+  minWidth: 0,
+  overflowWrap: "anywhere",
 };
 
 export type ZapretState = {
@@ -45,6 +48,10 @@ export type ZapretState = {
   game_presets_available?: boolean;
   /** both | tcp | udp — файл utils/gamefilter.mode (starter.sh) */
   gamefilter_protocol_mode?: string;
+  gamefilter_ports_available?: boolean;
+  gamefilter_custom_ports?: Partial<Record<"tcp" | "udp", string>> | null;
+  gamefilter_default_ports?: Record<"tcp" | "udp", string> | null;
+  gamefilter_ports_error?: string | null;
   gamefilter_ok?: boolean;
   gamefilter_message?: string;
   ipset_filter_mode?: string;
@@ -58,7 +65,7 @@ let api: ServerAPI;
 const setServerAPI = (s: ServerAPI) => (api = s);
 
 async function call<T>(name: string, params: Record<string, unknown> = {}): Promise<T> {
-  const r = await api.callPluginMethod<T>(name, params);
+  const r = await api.callPluginMethod<Record<string, unknown>, T>(name, params);
   if (r.success) return r.result;
   throw r.result;
 }
@@ -140,7 +147,7 @@ function gameFilterProtocolSuffix(ru: boolean, m: string | undefined): string {
 function gameFilterStatusLine(ru: boolean, s: ZapretState): string {
   const prefix = ru ? "GameFilter: " : "GameFilter: ";
   const suf = s.gamefilter_enabled ? gameFilterProtocolSuffix(ru, s.gamefilter_protocol_mode) : "";
-  if (s.game_preset_name) return prefix + s.game_preset_name + suf;
+  if (s.game_preset_id) return prefix + (s.game_preset_name || s.game_preset_id) + suf;
   if (s.gamefilter_enabled) return prefix + (ru ? "включено" : "enabled") + suf;
   return prefix + (ru ? "отключено" : "disabled");
 }
@@ -275,13 +282,13 @@ function ManagerInstallHome({ ru, onInstalled }: { ru: boolean; onInstalled: () 
         const st = r.result.status;
         if (st === "already_installed") {
           api.toaster.toast({
-            title: "Zapret DPI",
+            title: <span>Zapret DPI</span>,
             body: ru ? "Zapret DPI Manager уже установлен." : "Zapret DPI Manager is already installed.",
           });
           onInstalled();
         } else if (st === "started") {
           api.toaster.toast({
-            title: "Zapret DPI",
+            title: <span>Zapret DPI</span>,
             body: ru
               ? "Установка запущена в фоне. Подождите несколько минут. Если не появится — откройте лог /tmp/deckyzapretdpi_manager_install.log в режиме рабочего стола или установите менеджер вручную с GitHub."
               : "Installation started in the background. Wait a few minutes. If nothing changes, open /tmp/deckyzapretdpi_manager_install.log in Desktop mode or install the manager manually from GitHub.",
@@ -381,13 +388,13 @@ function ZapretServiceInstallHome({ ru, onInstalled }: { ru: boolean; onInstalle
         const st = r.result.status;
         if (st === "already_installed") {
           api.toaster.toast({
-            title: "Zapret DPI",
+            title: <span>Zapret DPI</span>,
             body: ru ? "Служба Zapret уже установлена." : "Zapret service is already installed.",
           });
           onInstalled();
         } else if (st === "started") {
           api.toaster.toast({
-            title: "Zapret DPI",
+            title: <span>Zapret DPI</span>,
             body: ru
               ? "Установка службы запущена в фоне. Подождите. Лог: /tmp/deckyzapretdpi_zapret_install.log (режим рабочего стола)."
               : "Service install started in the background. Wait. Log: /tmp/deckyzapretdpi_zapret_install.log (Desktop mode).",
@@ -448,6 +455,7 @@ const Content = () => {
   const [busy, setBusy] = useState(false);
   const [applyBusy, setApplyBusy] = useState(false);
   const [gfBusy, setGfBusy] = useState(false);
+  const [gfEditing, setGfEditing] = useState(false);
   const [ipsetBusy, setIpsetBusy] = useState(false);
   const [gamePresets, setGamePresets] = useState<GamePresetRow[]>([]);
 
@@ -513,31 +521,34 @@ const Content = () => {
     : "List is empty. Open plugin settings (gear) → “Strategy auto-pick” and run auto-pick, same as in Zapret DPI Manager.";
 
   const presetDropdownOptions = useMemo(() => {
-    const noneLabel = ru ? "Ничего" : "None";
+    const noneLabel = ru ? "Не выбран" : "None";
     const head = [{ data: NONE_PRESET, label: noneLabel }];
     const tail = gamePresets.map((p) => ({ data: p.id, label: p.name }));
+    if (state?.game_preset_id && !tail.some((p) => p.data === state.game_preset_id)) {
+      tail.push({ data: state.game_preset_id, label: state.game_preset_name || state.game_preset_id });
+    }
     return head.concat(tail);
-  }, [ru, gamePresets]);
+  }, [ru, gamePresets, state?.game_preset_id, state?.game_preset_name]);
 
   const selectedPresetOption = useMemo(() => {
     const pid = state?.game_preset_id;
     if (!pid) return presetDropdownOptions[0] ?? null;
     const hit = presetDropdownOptions.find((o) => o.data === pid);
-    return hit ?? presetDropdownOptions[0] ?? null;
+    return hit ?? { data: pid, label: state?.game_preset_name || pid };
   }, [state?.game_preset_id, presetDropdownOptions]);
 
   const ipsetModeOptions = useMemo(
     () =>
       ru
         ? [
-            { data: "none", label: "none — тестовый IP, без списка" },
-            { data: "loaded", label: "loaded — проверка по списку ipset" },
-            { data: "any", label: "any — любой IP в фильтре" },
+            { data: "none", label: "none" },
+            { data: "loaded", label: "loaded" },
+            { data: "any", label: "any" },
           ]
         : [
-            { data: "none", label: "none — test IP, no list" },
-            { data: "loaded", label: "loaded — match ipset list" },
-            { data: "any", label: "any — every IP filtered" },
+            { data: "none", label: "none" },
+            { data: "loaded", label: "loaded" },
+            { data: "any", label: "any" },
           ],
     [ru],
   );
@@ -716,9 +727,10 @@ const Content = () => {
       {dropdownOptions.length > 0 ? (
         <PanelSectionRow>
           <DropdownItem
+            layout="below"
             label={ru ? "Выбрать стратегию" : "Choose strategy"}
             rgOptions={dropdownOptions}
-            selectedOption={selectedDropdown}
+            selectedOption={selectedDropdown?.data}
             disabled={applyBusy}
             strDefaultLabel={ru ? "Выберите стратегию…" : "Choose strategy…"}
             renderButtonValue={(element) => (selectedDropdown ? selectedDropdown.label : element)}
@@ -755,9 +767,10 @@ const Content = () => {
       </PanelSectionRow>
       <PanelSectionRow>
         <DropdownItem
+            layout="below"
           label={ru ? "Включить GameFilter" : "Enable GameFilter"}
           rgOptions={gfPowerDropdownOptions}
-          selectedOption={selectedGfPowerOption}
+          selectedOption={selectedGfPowerOption?.data}
           disabled={gfBusy || !state}
           strDefaultLabel={ru ? "Выберите режим…" : "Choose mode…"}
           renderButtonValue={(element) =>
@@ -780,7 +793,18 @@ const Content = () => {
             if (raw.toLowerCase() === cur) return;
             setGfBusy(true);
             try {
-              const next = await set_gamefilter_protocol_mode(raw);
+              const custom = state.gamefilter_custom_ports;
+              const protocols: ("tcp" | "udp")[] = mode === "both" ? ["tcp", "udp"] : [mode];
+              const needsDefaults = custom && protocols.some((protocol) => !custom[protocol]);
+              const ports = Object.fromEntries(protocols.map((protocol) => [
+                protocol, custom?.[protocol] || state.gamefilter_default_ports?.[protocol] || "",
+              ]));
+              const next = needsDefaults
+                ? await call<ZapretState>("set_gamefilter_ports", {
+                    mode, ports, reset: false,
+                    expected_settings: { mode: cur, ports: custom, error: state.gamefilter_ports_error },
+                  })
+                : await set_gamefilter_protocol_mode(raw);
               setState(next);
             } catch {
               setState((prev) =>
@@ -799,19 +823,28 @@ const Content = () => {
         />
       </PanelSectionRow>
       <PanelSectionRow>
+        <span style={{ ...panelBodyNoIndent, fontSize: 12, opacity: 0.75 }}>
+          {ru ? "При смене режима новый протокол начинает со стандартных портов." : "When changing mode, a newly selected protocol starts with default ports."}
+        </span>
+      </PanelSectionRow>
+      {state && <GameFilterPorts state={state} ru={ru} disabled={gfBusy} onSaved={setState} onBusyChange={setGfBusy} onEditingChange={setGfEditing}
+        save={(mode, ports, reset, expected_settings) => call<ZapretState>("set_gamefilter_ports", { mode, ports, reset, expected_settings })} />}
+      <PanelSectionRow>
         <DropdownItem
+          layout="below"
           label={ru ? "Пресет для игры" : "Game preset"}
           rgOptions={presetDropdownOptions}
-          selectedOption={selectedPresetOption}
-          disabled={gfBusy || !state?.game_presets_available}
-          strDefaultLabel={ru ? "Включить пресет для игры" : "Enable game preset"}
+          selectedOption={selectedPresetOption?.data}
+          disabled={gfBusy || gfEditing || !state?.game_presets_available}
+          strDefaultLabel={ru ? "Не выбран" : "None"}
           renderButtonValue={() => {
             if (!selectedPresetOption || selectedPresetOption.data === NONE_PRESET) {
-              return ru ? "Включить пресет для игры" : "Enable game preset";
+              return ru ? "Не выбран" : "None";
             }
             return selectedPresetOption.label;
           }}
           onChange={async (opt) => {
+            if (gfEditing) return;
             const raw = opt?.data as string | undefined;
             if (raw == null) return;
             const preset_id = raw === NONE_PRESET ? null : raw;
@@ -838,6 +871,7 @@ const Content = () => {
           }}
         />
       </PanelSectionRow>
+      {state.game_preset_id && <PanelSectionRow><span style={{ ...panelBodyNoIndent, fontSize: 12 }}>{selectedPresetOption?.label}</span></PanelSectionRow>}
       {!state?.game_presets_available ? (
         <PanelSectionRow>
           <span style={{ ...panelBodyNoIndent, fontSize: 11, opacity: 0.7, whiteSpace: "pre-wrap" }}>
@@ -859,9 +893,10 @@ const Content = () => {
       </PanelSectionRow>
       <PanelSectionRow>
         <DropdownItem
+          layout="below"
           label={ru ? "Режим IPsetFilter" : "IPsetFilter mode"}
           rgOptions={ipsetModeOptions}
-          selectedOption={selectedIpsetOption}
+          selectedOption={selectedIpsetOption?.data}
           disabled={ipsetBusy || !state}
           strDefaultLabel={ru ? "Выберите режим…" : "Choose mode…"}
           renderButtonValue={(element) => (selectedIpsetOption ? selectedIpsetOption.label : element)}
@@ -891,8 +926,8 @@ const Content = () => {
       <PanelSectionRow>
         <span style={{ ...panelBodyNoIndent, fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
           {ru
-            ? "Полезно, если ресурс без Zapret работает, а с Zapret — нет."
-            : "Useful when a site works without Zapret but not with it."}
+            ? "none — тестовый IP, без списка; loaded — проверка по списку ipset; any — любой IP в фильтре. Полезно, если ресурс без Zapret работает, а с Zapret — нет."
+            : "none — test IP, no list; loaded — match ipset list; any — every IP filtered. Useful when a site works without Zapret but not with it."}
         </span>
       </PanelSectionRow>
       {state?.ipset_message != null && state.ipset_ok === false ? (
@@ -951,6 +986,9 @@ export default definePlugin((serverAPI: ServerAPI) => {
   ));
 
   return {
+    // Decky temporarily hides QAM for native dropdowns; keep editor drafts mounted.
+    alwaysRender: true,
+    title: <span>Zapret DPI</span>,
     titleView: <TitleView />,
     content: <Content />,
     icon: <FaShieldAlt />,
