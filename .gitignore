@@ -1,1 +1,13 @@
 git-add-commit-loop.sh
+
+# Local verification and build dependencies
+/tests/
+/node_modules/
+__pycache__/
+*.py[cod]
+
+# Local assistant and environment files
+/.agents/
+/.codex/
+/.aws/
+/.env
