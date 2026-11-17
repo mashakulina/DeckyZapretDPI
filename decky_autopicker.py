@@ -16,6 +16,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+_bridge_spec = importlib.util.spec_from_file_location("decky_manager_bridge", Path(__file__).with_name("manager_bridge.py"))
+_bridge = importlib.util.module_from_spec(_bridge_spec)
+_bridge_spec.loader.exec_module(_bridge)
+
 _MAX_LOG_CHARS = 96_000
 _LOG_LINES: collections.deque[str] = collections.deque(maxlen=5000)
 _log_lock = threading.Lock()
@@ -433,6 +437,7 @@ def _ensure_strategy_tester() -> bool:
         try:
             if mod_name in sys.modules:
                 del sys.modules[mod_name]
+            _bridge.manager_module(_MANAGER, 'game_presets')
             spec = importlib.util.spec_from_file_location(mod_name, st_path)
             if spec is None or spec.loader is None:
                 _import_err = "spec_from_file_location failed"
@@ -650,47 +655,20 @@ def _restart_zapret_for_autopick() -> tuple[bool, str]:
         if r.returncode != 0:
             tail = ((r.stderr or r.stdout or "").strip()[:400] or "systemctl failed")
             return False, tail
+        active = subprocess.run(
+            ["systemctl", "is-active", "zapret"], capture_output=True, text=True,
+            timeout=30, env=_clean_env(),
+        )
+        if active.returncode != 0 or (active.stdout or '').strip() != 'active':
+            return False, 'Служба Zapret не активна после перезапуска.'
         return True, "ok"
     except Exception as e:
         return False, str(e)
 
 
-def _apply_working_strategy_name(strategy_name: str) -> tuple[bool, str]:
-    """Как main._apply_strategy_from_file: только стратегии из utils/working_strategies.txt."""
-    if not strategy_name or "/" in strategy_name or "\\" in strategy_name or ".." in strategy_name:
-        return False, "invalid_name"
-    if strategy_name.startswith("."):
-        return False, "invalid_name"
-    m = _MANAGER
-    ws = m / "utils" / "working_strategies.txt"
-    if not ws.is_file():
-        return False, "no_working_list"
-    try:
-        allowed = {ln.strip() for ln in ws.read_text(encoding="utf-8").splitlines() if ln.strip()}
-    except OSError as e:
-        return False, str(e)
-    if strategy_name not in allowed:
-        return False, "not_in_working_list"
-    sf = m / "files" / "strategy" / strategy_name
-    if not sf.is_file():
-        return False, "file_not_found"
-    try:
-        content = sf.read_text(encoding="utf-8").strip()
-    except OSError as e:
-        return False, str(e)
-    name_f = m / "utils" / "name_strategy.txt"
-    config_f = m / "config.txt"
-    try:
-        name_f.parent.mkdir(parents=True, exist_ok=True)
-        if not content:
-            name_f.write_text("", encoding="utf-8")
-            config_f.write_text("", encoding="utf-8")
-        else:
-            name_f.write_text(strategy_name, encoding="utf-8")
-            config_f.write_text(content, encoding="utf-8")
-    except OSError as e:
-        return False, str(e)
-    return _restart_zapret_for_autopick()
+def _apply_working_strategy_name(strategy_name: str, restart=True) -> tuple[bool, str]:
+    callback = _restart_zapret_for_autopick if restart else None
+    return _bridge.apply_strategy(_MANAGER, strategy_name, callback)
 
 
 def stop() -> dict:
@@ -729,39 +707,40 @@ def start(strategies: Optional[list[str]] = None) -> dict:
         old_out, old_err = sys.stdout, sys.stderr
 
         try:
-            sys.stdout = cap  # type: ignore[assignment]
-            sys.stderr = cap  # type: ignore[assignment]
-            _set_state(
-                running=True,
-                phase="running",
-                message="Тестирование…",
-                error=None,
-                started_at=time.time(),
-                finished_at=0.0,
-                mode=mode,
-                working_count=0,
-            )
-            tester = DeckyStrategyTester(str(_MANAGER), None)
-            with _lock:
-                _current_tester = tester
+            with _bridge.manager_change(_MANAGER, restart=_restart_zapret_for_autopick):
+                sys.stdout = cap  # type: ignore[assignment]
+                sys.stderr = cap  # type: ignore[assignment]
+                _set_state(
+                    running=True,
+                    phase="running",
+                    message="Тестирование…",
+                    error=None,
+                    started_at=time.time(),
+                    finished_at=0.0,
+                    mode=mode,
+                    working_count=0,
+                )
+                tester = DeckyStrategyTester(str(_MANAGER), None)
+                with _lock:
+                    _current_tester = tester
 
-            _raw_results = loop.run_until_complete(tester.run_full_test(mode, strategies=strat_arg))
-            all_results: List[Dict[str, Any]] = _raw_results if isinstance(_raw_results, list) else []
-            cap.flush()
+                _raw_results = loop.run_until_complete(tester.run_full_test(mode, strategies=strat_arg))
+                all_results: List[Dict[str, Any]] = _raw_results if isinstance(_raw_results, list) else []
+                cap.flush()
 
-            ws = _MANAGER / "utils" / "working_strategies.txt"
-            working_names: list[str] = []
-            if ws.is_file():
-                working_names = [ln.strip() for ln in ws.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            wc = len(working_names)
-            working_set = set(working_names)
+                ws = _MANAGER / "utils" / "working_strategies.txt"
+                working_names: list[str] = []
+                if ws.is_file():
+                    working_names = [ln.strip() for ln in ws.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                wc = len(working_names)
+                working_set = set(working_names)
 
-            stopped = bool(getattr(tester, "stop_requested", False))
-            best = _pick_best_strategy_name(all_results, mode)
-            apply_ok = False
-            apply_msg = ""
-            if best and not stopped and best in working_set:
-                apply_ok, apply_msg = _apply_working_strategy_name(best)
+                stopped = bool(getattr(tester, "stop_requested", False))
+                best = _pick_best_strategy_name(all_results, mode)
+                apply_ok = False
+                apply_msg = ""
+                if best and not stopped and best in working_set:
+                    apply_ok, apply_msg = _apply_working_strategy_name(best, restart=False)
 
             _finalize_autopicker_log(working_names)
 
@@ -786,7 +765,6 @@ def start(strategies: Optional[list[str]] = None) -> dict:
                 )
 
             _set_state(
-                running=False,
                 phase="done",
                 message="Тестирование завершено.",
                 finished_at=time.time(),
@@ -794,7 +772,6 @@ def start(strategies: Optional[list[str]] = None) -> dict:
             )
         except Exception as e:
             _set_state(
-                running=False,
                 phase="error",
                 error=str(e),
                 message=str(e)[:240],
@@ -807,6 +784,12 @@ def start(strategies: Optional[list[str]] = None) -> dict:
             with _lock:
                 _current_tester = None
             loop.close()
+            _set_state(running=False)
 
+    with _lock:
+        if _state["running"]:
+            return {"ok": False, "detail": "already_running"}
+        _state["running"] = True
+        _state["phase"] = "starting"
     threading.Thread(target=worker, name="decky-autopicker", daemon=True).start()
     return {"ok": True, "detail": "started"}

@@ -8,9 +8,6 @@ API_URL="https://api.github.com/repos/mashakulina/DeckyZapretDPI/releases/latest
 echo "== Stopping plugin_loader =="
 sudo systemctl stop plugin_loader.service || true
 
-echo "== Removing old plugin =="
-sudo rm -rf "$PLUGIN_DIR"
-
 TMP_DIR="$(mktemp -d /tmp/deckyzapretdpi_install.XXXXXX)"
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -43,12 +40,13 @@ if [[ -z "$INNER_DIR" || ! -d "$INNER_DIR" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$INNER_DIR/main.py" || ! -f "$INNER_DIR/plugin.json" || ! -f "$INNER_DIR/dist/index.js" ]]; then
-  echo "ERROR: archive is missing main.py, plugin.json, or dist/index.js"
+if [[ ! -f "$INNER_DIR/main.py" || ! -f "$INNER_DIR/decky_autopicker.py" || ! -f "$INNER_DIR/manager_bridge.py" || ! -f "$INNER_DIR/plugin.json" || ! -f "$INNER_DIR/dist/index.js" ]]; then
+  echo "ERROR: archive is missing main.py, decky_autopicker.py, manager_bridge.py, plugin.json, or dist/index.js"
   exit 1
 fi
 
 echo "== Installing to $PLUGIN_DIR =="
+sudo rm -rf "$PLUGIN_DIR"
 sudo mkdir -p "$PLUGIN_DIR"
 sudo cp -a "$INNER_DIR"/. "$PLUGIN_DIR/"
 

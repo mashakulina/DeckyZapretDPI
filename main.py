@@ -13,6 +13,13 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
+# Shared backend bridge is loaded by path because Decky may omit the plugin
+# directory from sys.path. Core modules always come from the explicit manager.
+_bridge_spec = importlib.util.spec_from_file_location("decky_manager_bridge", pathlib.Path(__file__).with_name("manager_bridge.py"))
+_bridge = importlib.util.module_from_spec(_bridge_spec)
+_bridge_spec.loader.exec_module(_bridge)
+
+
 def _plugin_json_path() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent / "plugin.json"
 
@@ -141,16 +148,7 @@ def _load_game_presets() -> None:
         _game_presets_load_error = f"Файл не найден: {mod_path}"
         return
     try:
-        sys.modules.pop(_DECKY_GAME_PRESETS_MOD, None)
-        _ensure_manager_syspath_for_presets()
-        spec = importlib.util.spec_from_file_location(_DECKY_GAME_PRESETS_MOD, mod_path)
-        if spec is None or spec.loader is None:
-            _game_presets_load_error = "Не удалось создать spec для game_presets"
-            return
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[_DECKY_GAME_PRESETS_MOD] = mod
-        spec.loader.exec_module(mod)
-        _game_presets = mod
+        _game_presets = _bridge.manager_module(_MANAGER_ROOT, 'game_presets')
         try:
             _game_presets_mtime = mod_path.stat().st_mtime
         except OSError:
@@ -183,6 +181,7 @@ _load_game_presets()
 def _clean_env():
     env = os.environ.copy()
     env.pop("LD_LIBRARY_PATH", None)
+    env.pop("LD_PRELOAD", None)
     return env
 
 
@@ -318,47 +317,20 @@ def _safe_strategy_basename(name: str) -> bool:
 
 
 def _apply_strategy_from_file(manager: pathlib.Path, strategy_name: str) -> tuple[bool, str]:
-    """Same logic as Zapret DPI Manager strategy_window.apply_strategy (file preset)."""
-    if not _safe_strategy_basename(strategy_name):
-        return False, "invalid_name"
-    allowed = set(_read_working_strategy_names(manager))
-    if strategy_name not in allowed:
-        return False, "not_in_working_list"
-    strategy_file = manager / "files" / "strategy" / strategy_name
-    if not strategy_file.is_file():
-        return False, "file_not_found"
-    try:
-        strategy_content = strategy_file.read_text(encoding="utf-8").strip()
-    except OSError as e:
-        return False, str(e)
-    name_strategy_file = manager / "utils" / "name_strategy.txt"
-    config_file = manager / "config.txt"
-    try:
-        name_strategy_file.parent.mkdir(parents=True, exist_ok=True)
-        if not strategy_content:
-            name_strategy_file.write_text("", encoding="utf-8")
-            config_file.write_text("", encoding="utf-8")
-        else:
-            name_strategy_file.write_text(strategy_name, encoding="utf-8")
-            config_file.write_text(
-                strategy_content + ("\n" if strategy_content else ""),
-                encoding="utf-8",
-            )
-            # Как в менеджере (strategy_window): после перезаписи config.txt снова применить игровой пресет.
-            _maybe_reload_game_presets()
-            if _game_presets is not None:
-                _game_presets.reapply_active_preset_to_config(str(manager))
-    except OSError as e:
-        return False, str(e)
-    return _restart_zapret_service()
+    return _bridge.apply_strategy(manager, strategy_name, _restart_zapret_service)
 
 
 def _restart_zapret_service() -> tuple[bool, str]:
-    r = _run_systemctl("restart", "zapret")
-    if r.returncode != 0:
-        tail = (r.stdout or "").strip()[:200] or "systemctl failed"
-        return False, tail
-    return True, "ok"
+    try:
+        result = _run_systemctl("restart", "zapret")
+        if result.returncode != 0:
+            return False, (result.stdout or "").strip()[:200] or "systemctl failed"
+        active = _run_systemctl("is-active", "zapret")
+        if active.returncode != 0 or (active.stdout or '').strip() != 'active':
+            return False, 'Служба Zapret не активна после перезапуска.'
+        return True, "ok"
+    except Exception as error:
+        return False, str(error)
 
 
 def _gamefilter_enable_path(manager: pathlib.Path) -> pathlib.Path:
@@ -406,8 +378,8 @@ def _read_gamefilter_state(manager: pathlib.Path) -> tuple[bool, Optional[str], 
         try:
             pid = _game_presets.get_active_preset_id(str(manager))
             preset_id = pid
-            if pid and pid in _game_presets.GAME_PRESETS:
-                preset_name = _game_presets.GAME_PRESETS[pid]["name"]
+            if pid and pid in _game_presets.get_game_presets(str(manager)):
+                preset_name = _game_presets.get_game_presets(str(manager))[pid]["name"]
         except Exception:
             pass
     return enabled, preset_id, preset_name
@@ -419,152 +391,76 @@ def _list_game_presets_dicts() -> list[dict[str, str]]:
         return []
     out: list[dict[str, str]] = []
     try:
-        for pid, data in _game_presets.GAME_PRESETS.items():
+        for pid, data in _game_presets.get_game_presets(str(_manager_dir())).items():
             out.append({"id": pid, "name": str(data.get("name", pid))})
     except Exception:
         return []
     return out
 
 
-def _gp_is_list_ipset_preset(preset_id: str) -> bool:
-    """Старые game_presets.py без LIST_IPSET не ломают плагин."""
-    if _game_presets is None:
-        return False
-    fn = getattr(_game_presets, "is_list_ipset_preset", None)
-    if not callable(fn):
-        return False
-    try:
-        return bool(fn(preset_id))
-    except Exception:
-        return False
-
-
-def _gp_clear_list_ipset_if_needed(preset_id: str, mdir: str) -> None:
-    if not _gp_is_list_ipset_preset(preset_id):
-        return
-    fn = getattr(_game_presets, "clear_list_ipset_for_preset", None) if _game_presets else None
-    if callable(fn):
-        fn(preset_id, mdir)
-
-
-def _gp_apply_list_ipset_if_needed(preset_id: str, mdir: str) -> None:
-    if not _gp_is_list_ipset_preset(preset_id):
-        return
-    fn = getattr(_game_presets, "apply_list_ipset_for_preset", None) if _game_presets else None
-    if callable(fn):
-        fn(preset_id, mdir)
-
-
-def _disable_standalone_gamefilter(manager: pathlib.Path) -> None:
-    """Как disable_standalone_gamefilter в менеджере: только файлы, без перезапуска."""
-    try:
-        p = _gamefilter_enable_path(manager)
-        if p.is_file():
-            p.unlink()
-        _remove_gamefilter_mode_file(manager)
-    except OSError:
-        pass
-
-
-def _clear_game_preset_side_effects(manager: pathlib.Path) -> None:
-    """Снимает активный пресет с диска (как clear в set_game_preset). Без перезапуска службы."""
-    _maybe_reload_game_presets()
-    if _game_presets is None:
-        return
-    mdir = str(manager)
-    active_before = _game_presets.get_active_preset_id(mdir)
-    if active_before:
-        _game_presets.remove_preset_lines_from_config(active_before, mdir)
-        _gp_clear_list_ipset_if_needed(active_before, mdir)
-        if active_before == "elite_dangerous":
-            _set_ipset_all_to_none_marker(manager)
-        _game_presets.restore_gamefilter_for_preset(active_before, mdir)
-    _game_presets.clear_active_preset(mdir)
-
-
 def _set_game_preset_impl(manager: pathlib.Path, preset_id: Optional[str]) -> tuple[bool, str]:
-    """preset_id None / empty / 'none' clears preset; otherwise apply known preset."""
-    _maybe_reload_game_presets()
-    if _game_presets is None:
-        return False, "game_presets_unavailable"
-    mdir = str(manager)
     clear = not preset_id or str(preset_id).strip().lower() in ("", "none", "null")
-    if not clear:
-        pid = str(preset_id).strip()
-        if pid not in _game_presets.GAME_PRESETS:
-            return False, "invalid_preset"
+    pid = None if clear else str(preset_id).strip()
+    return _bridge.mutate(manager, lambda: _bridge.manager_module(manager, 'game_mode').apply_game_preset_disk(str(manager), pid), _restart_zapret_service)
 
+
+def _toggle_gamefilter_impl(manager: pathlib.Path, protocol_mode: Optional[str] = None) -> tuple[bool, str]:
+    return _bridge.mutate(manager, lambda: _bridge.manager_module(manager, 'game_mode').toggle_gamefilter_disk(str(manager), protocol_mode), _restart_zapret_service)
+
+
+def _gamefilter_ports_state(manager: pathlib.Path) -> dict:
+    """Expose stored settings, never starter.sh's disabled-protocol sentinel."""
+    result = {"gamefilter_ports_available": False, "gamefilter_custom_ports": None,
+              "gamefilter_default_ports": None, "gamefilter_ports_error": None}
     try:
-        if clear:
-            _clear_game_preset_side_effects(manager)
-            return _restart_zapret_service()
-
-        _disable_standalone_gamefilter(manager)
-
-        pid = str(preset_id).strip()
-        active_before = _game_presets.get_active_preset_id(mdir)
-        if active_before and active_before != pid:
-            _game_presets.remove_preset_lines_from_config(active_before, mdir)
-            _gp_clear_list_ipset_if_needed(active_before, mdir)
-            if active_before == "elite_dangerous":
-                _set_ipset_all_to_none_marker(manager)
-            _game_presets.restore_gamefilter_for_preset(active_before, mdir)
-
-        _game_presets.set_active_preset(pid, mdir)
-        preset = _game_presets.GAME_PRESETS[pid]
-        tcp = preset.get("game_filter_tcp")
-        udp = preset.get("game_filter_udp")
-        if tcp is not None and udp is not None:
-            _game_presets.substitute_gamefilter_in_config(tcp, udp, mdir)
-        _gp_apply_list_ipset_if_needed(pid, mdir)
-        if pid == "elite_dangerous":
-            _apply_ipset_loaded_from_utils(manager)
-        lines = preset.get("lines") or []
-        if lines:
-            config_path = manager / "config.txt"
-            existing = ""
-            if config_path.is_file():
-                existing = config_path.read_text(encoding="utf-8")
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.write_text("\n".join(lines) + "\n" + existing, encoding="utf-8")
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-    return _restart_zapret_service()
+        settings = _bridge.manager_module(manager, 'game_filter_settings')
+        required = ('read_game_filter_custom_ports', 'validate_game_filter_custom_ports',
+                    'write_game_filter_settings', 'DEFAULT_GAME_FILTER_TCP_PORTS',
+                    'DEFAULT_GAME_FILTER_UDP_PORTS')
+        if not all(hasattr(settings, name) for name in required):
+            return result
+        result['gamefilter_ports_available'] = True
+        result['gamefilter_default_ports'] = {
+            'tcp': settings.DEFAULT_GAME_FILTER_TCP_PORTS,
+            'udp': settings.DEFAULT_GAME_FILTER_UDP_PORTS,
+        }
+        result['gamefilter_custom_ports'] = settings.read_game_filter_custom_ports(str(manager))
+    except (ImportError, AttributeError):
+        pass
+    except Exception as error:
+        result['gamefilter_ports_error'] = str(error)
+    return result
 
 
-def _toggle_gamefilter_impl(
-    manager: pathlib.Path, protocol_mode: Optional[str] = None
-) -> tuple[bool, str]:
-    """Вкл/выкл gamefilter.enable; при выкл удаляет gamefilter.mode; при вкл пишет режим (как в Zapret DPI Manager)."""
-    path = _gamefilter_enable_path(manager)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_file():
-            path.unlink()
-            _remove_gamefilter_mode_file(manager)
-        else:
-            _clear_game_preset_side_effects(manager)
-            path.write_text("", encoding="utf-8")
-            mode = _normalize_gamefilter_protocol_mode(protocol_mode)
-            mode_path = _gamefilter_mode_path(manager)
-            mode_path.write_text(mode + "\n", encoding="utf-8")
-    except OSError as e:
-        return False, str(e)
-    return _restart_zapret_service()
+def _set_gamefilter_ports_impl(manager: pathlib.Path, mode: Any, ports: Any,
+                               reset: bool = False, expected_mode: Any = None,
+                               expected_settings: Any = None) -> tuple[bool, str]:
+    def save():
+        settings = _bridge.manager_module(manager, 'game_filter_settings')
+        if not all(hasattr(settings, name) for name in
+                   ('validate_game_filter_custom_ports', 'write_game_filter_settings')):
+            raise ValueError('GameFilter port editing requires an updated manager.')
+        if not _gamefilter_enable_path(manager).is_file():
+            raise ValueError('GameFilter выключен / GameFilter is disabled.')
+        if _bridge.manager_module(manager, 'game_presets').get_active_preset_id(str(manager)):
+            raise ValueError('Активен пресет игры / A game preset is active.')
+        if expected_mode is not None and settings.read_game_filter_protocol_mode(str(manager)) != expected_mode:
+            raise ValueError('Режим изменился. Откройте редактор снова / Mode changed. Reopen the editor.')
+        current = _gamefilter_ports_state(manager)
+        if expected_settings is not None and expected_settings != {
+                'mode': settings.read_game_filter_protocol_mode(str(manager)),
+                'ports': current['gamefilter_custom_ports'],
+                'error': current['gamefilter_ports_error']}:
+            raise ValueError('Настройки изменились. Откройте редактор снова / Settings changed. Reopen the editor.')
+        if not reset and ports is None:
+            raise ValueError('Укажите порты / Enter ports.')
+        normalized = settings.validate_game_filter_custom_ports(mode, None if reset else ports)
+        settings.write_game_filter_settings(mode, normalized, str(manager))
+    return _bridge.mutate(manager, save, _restart_zapret_service)
 
 
 def _set_gamefilter_protocol_mode_impl(manager: pathlib.Path, mode: str) -> tuple[bool, str]:
-    if not _gamefilter_enable_path(manager).is_file():
-        return False, "gamefilter_disabled"
-    m = _normalize_gamefilter_protocol_mode(mode)
-    mode_path = _gamefilter_mode_path(manager)
-    try:
-        mode_path.parent.mkdir(parents=True, exist_ok=True)
-        mode_path.write_text(m + "\n", encoding="utf-8")
-    except OSError as e:
-        return False, str(e)
-    return _restart_zapret_service()
+    return _bridge.mutate(manager, lambda: _bridge.manager_module(manager, 'game_mode').set_gamefilter_mode_disk(str(manager), mode), _restart_zapret_service)
 
 
 _IPSET_NONE_MARKER = "203.0.113.113/32"
@@ -626,7 +522,7 @@ def _read_ipset_filter_mode(manager: pathlib.Path) -> str:
         return "none"
 
 
-def _set_ipset_filter_mode_impl(manager: pathlib.Path, mode: str) -> tuple[bool, str]:
+def _set_ipset_filter_mode_disk(manager: pathlib.Path, mode: str) -> tuple[bool, str]:
     m = (mode or "").strip().lower()
     if m not in ("none", "loaded", "any"):
         return False, "invalid_ipset_mode"
@@ -644,7 +540,16 @@ def _set_ipset_filter_mode_impl(manager: pathlib.Path, mode: str) -> tuple[bool,
             ipset_all_file.write_text(_IPSET_NONE_MARKER, encoding="utf-8")
     except OSError as e:
         return False, str(e)
-    return _restart_zapret_service()
+    return True, "ok"
+
+
+
+def _set_ipset_filter_mode_impl(manager: pathlib.Path, mode: str) -> tuple[bool, str]:
+    def save():
+        ok, message = _set_ipset_filter_mode_disk(manager, mode)
+        if not ok:
+            raise ValueError(message)
+    return _bridge.mutate(manager, save, _restart_zapret_service)
 
 
 def _collect_state() -> dict:
@@ -668,6 +573,7 @@ def _collect_state() -> dict:
         "game_preset_name": gf_name,
         "game_presets_available": _game_presets is not None,
         "gamefilter_protocol_mode": _read_gamefilter_protocol_mode(manager),
+        **_gamefilter_ports_state(manager),
         "ipset_filter_mode": _read_ipset_filter_mode(manager),
     }
 
@@ -838,6 +744,63 @@ def _read_zapret_service_install_log_tail(max_chars: int = 2400) -> str:
         return ""
 
 
+def _build_service_install_script(manager, work, log, opt=None, units=None):
+    """Use the installed manager bundle; preserve the selected firewall backend."""
+    system = pathlib.Path(manager) / 'zapret/system'
+    for name in ('starter.sh', 'stopper.sh', 'firewall.sh', 'zapret.service', 'FWTYPE'):
+        if not (system / name).is_file():
+            raise ValueError('Обновите менеджер: отсутствует runtime-файл ' + name)
+    quote = lambda path: shlex.quote(str(path))
+    return f"""#!/bin/bash
+set -e
+exec > >(tee -a {quote(log)}) 2>&1
+SYSTEM_DIR={quote(system)}
+BINS_DIR={quote(pathlib.Path(manager) / 'zapret/bins')}
+OPT={quote(opt or _ZAPRET_OPT)}
+UNITS={quote(units or _ZAPRET_SYSTEMD_UNIT.parent)}
+WORK={quote(work)}
+mkdir -p "$WORK"
+# Validate and retain both explicit firewall selection files before copying.
+for name in FWTYPE FWTYPE.user; do
+  rm -f "$WORK/$name.saved"
+  if [[ -e "$OPT/$name" || -L "$OPT/$name" ]]; then
+    value=$(cat "$OPT/$name")
+    case "$value" in iptables|nftables) ;; *) echo "Invalid $name"; exit 1 ;; esac
+    cp -p "$OPT/$name" "$WORK/$name.saved"
+  fi
+done
+if [[ -f "$WORK/FWTYPE.user.saved" ]]; then
+  [[ -f "$WORK/FWTYPE.saved" ]] && cmp -s "$WORK/FWTYPE.saved" "$WORK/FWTYPE.user.saved" || exit 1
+fi
+case "$(cat "$SYSTEM_DIR/FWTYPE")" in iptables|nftables) ;; *) exit 1 ;; esac
+case "$(uname -m)" in
+ x86_64) BARCH=x86_64 ;; aarch64) BARCH=arm64 ;;
+ armv7l|armv6l) BARCH=arm ;; i386|i686) BARCH=x86 ;;
+ *) echo "Unsupported architecture"; exit 1 ;;
+esac
+[[ -f "$BINS_DIR/$BARCH/nfqws" ]] || {{ echo "Update manager: nfqws missing"; exit 1; }}
+if command -v steamos-readonly >/dev/null 2>&1; then
+ steamos-readonly disable
+ trap 'steamos-readonly enable || true' EXIT
+fi
+mkdir -p "$OPT" "$UNITS"
+# Never overwrite backend selection, even if a later installation step fails.
+for path in "$SYSTEM_DIR"/*; do
+ name=$(basename "$path")
+ [[ "$name" == FWTYPE || "$name" == FWTYPE.user ]] && continue
+ cp -a "$path" "$OPT/"
+done
+if [[ ! -f "$OPT/FWTYPE" ]]; then cp "$SYSTEM_DIR/FWTYPE" "$OPT/FWTYPE"; fi
+cp "$BINS_DIR/$BARCH/nfqws" "$OPT/nfqws"
+chmod +x "$OPT/nfqws" "$OPT/starter.sh" "$OPT/stopper.sh"
+cp "$SYSTEM_DIR/zapret.service" "$UNITS/zapret.service"
+chmod 644 "$UNITS/zapret.service"
+systemctl daemon-reload
+systemctl enable zapret.service
+systemctl start zapret.service
+"""
+
+
 def _install_zapret_service_thread() -> dict:
     """Фоновая установка zapret через systemd-run (root), по шагам как core/zapret_checker.install_zapret."""
     log_path = str(_ZAPRET_SVC_INSTALL_LOG)
@@ -853,80 +816,8 @@ def _install_zapret_service_thread() -> dict:
         if _ZAPRET_SVC_INSTALL_WORK.is_dir():
             shutil.rmtree(_ZAPRET_SVC_INSTALL_WORK, ignore_errors=True)
         _ZAPRET_SVC_INSTALL_WORK.mkdir(parents=True, exist_ok=True)
-        work_q = shlex.quote(str(_ZAPRET_SVC_INSTALL_WORK.resolve()))
-        log_q = shlex.quote(str(_ZAPRET_SVC_INSTALL_LOG.resolve()))
-        url_q = shlex.quote(_ZAPRET_SVC_ARCHIVE_URL)
-        unit_body = r"""[Unit]
-Description=zapret
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/opt/zapret
-ExecStart=/bin/bash /opt/zapret/starter.sh
-ExecStop=/bin/bash /opt/zapret/stopper.sh
-
-[Install]
-WantedBy=multi-user.target
-"""
-        # Скрипт выполняется под root (systemd-run / sudo systemd-run)
-        script = (
-            f"""#!/bin/bash
-set +e
-exec > >(tee -a {log_q}) 2>&1
-echo "== DeckyZapret: install zapret service $(date)"
-if command -v steamos-readonly >/dev/null 2>&1; then
-  steamos-readonly disable || true
-fi
-rm -rf {work_q}
-mkdir -p {work_q}
-cd {work_q} || exit 1
-curl -fSL -o zapret.tar.gz {url_q} || exit 1
-tar -xzf zapret.tar.gz || exit 1
-SYSTEM_DIR=$(find . -type d -name system | head -n 1)
-BINS_DIR=$(find . -type d -name bins | head -n 1)
-if [[ -z "$SYSTEM_DIR" || ! -d "$SYSTEM_DIR" ]]; then
-  echo "ERROR: system dir not found in archive"
-  exit 1
-fi
-mkdir -p /opt/zapret
-cp -a "$SYSTEM_DIR"/. /opt/zapret/ || exit 1
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64) BARCH=x86_64 ;;
-  aarch64) BARCH=arm64 ;;
-  armv7l|armv6l) BARCH=arm ;;
-  i386|i686) BARCH=x86 ;;
-  *) BARCH=x86_64 ;;
-esac
-if [[ -n "$BINS_DIR" && -d "$BINS_DIR/$BARCH" ]]; then
-  NFQWS="$BINS_DIR/$BARCH/nfqws"
-  if [[ -f "$NFQWS" ]]; then
-    cp -f "$NFQWS" /opt/zapret/nfqws
-    chmod +x /opt/zapret/nfqws
-  fi
-fi
-echo iptables > /opt/zapret/FWTYPE
-chmod -R o+r /opt/zapret/ 2>/dev/null || true
-cat > /tmp/zapret.service.deckyzapretdpi <<'EOFUNIT'
-"""
-            + f"{unit_body.rstrip()}\n"
-            + """EOFUNIT
-mkdir -p /etc/systemd/system
-cp /tmp/zapret.service.deckyzapretdpi /etc/systemd/system/zapret.service
-chmod 644 /etc/systemd/system/zapret.service
-rm -f /usr/lib/systemd/system/zapret.service 2>/dev/null || true
-systemctl daemon-reload || exit 1
-systemctl enable zapret.service 2>/dev/null || true
-systemctl start zapret.service 2>/dev/null || true
-if command -v steamos-readonly >/dev/null 2>&1; then
-  steamos-readonly enable || true
-fi
-echo "== finished $(date)"
-"""
-        )
+        bundle = _bridge.prepare_service_bundle(_MANAGER_ROOT, _ZAPRET_SVC_INSTALL_WORK)
+        script = _build_service_install_script(bundle, _ZAPRET_SVC_INSTALL_WORK, _ZAPRET_SVC_INSTALL_LOG)
         _ZAPRET_SVC_INSTALL_RUNNER.write_text(script, encoding="utf-8")
         _ZAPRET_SVC_INSTALL_RUNNER.chmod(0o755)
         try:
@@ -1074,6 +965,9 @@ if [ ! -d "$INNER_DIR" ]; then
   INNER_DIR=$(find . -maxdepth 1 -mindepth 1 -type d | head -n 1)
 fi
 [ ! -d "$INNER_DIR" ] && echo "ERROR: inner dir not found" && exit 1
+for required in main.py decky_autopicker.py manager_bridge.py plugin.json dist/index.js; do
+ [ -f "$INNER_DIR/$required" ] || {{ echo "ERROR: missing $required"; exit 1; }}
+done
 echo "== COPYING PLUGIN =="
 BACKUP="${{PLUGIN_DIR}}_backup_$(date +%s)"
 cp -r "$PLUGIN_DIR" "$BACKUP" || true
@@ -1251,7 +1145,7 @@ class Plugin:
         return await asyncio.to_thread(_collect_state)
 
     async def toggle_zapret(self) -> dict:
-        def _toggle():
+        def _perform_toggle():
             if not _zapret_service_installed():
                 out = _collect_state()
                 out["toggle_ok"] = False
@@ -1263,6 +1157,16 @@ class Plugin:
             else:
                 _run_systemctl("start", "zapret")
             return _collect_state()
+
+        def _toggle():
+            try:
+                with _bridge.manager_module(_MANAGER_ROOT, 'config_lock').manager_settings_lock(_MANAGER_ROOT):
+                    return _perform_toggle()
+            except Exception as error:
+                out = _collect_state()
+                out['toggle_ok'] = False
+                out['toggle_message'] = str(error)
+                return out
 
         return await asyncio.to_thread(_toggle)
 
@@ -1378,6 +1282,16 @@ class Plugin:
                 state["gamefilter_message"] = msg
             return state
 
+        return await asyncio.to_thread(_do)
+
+    async def set_gamefilter_ports(self, mode: Any = None, ports: Any = None,
+                                   reset: bool = False, expected_mode: Any = None,
+                                   expected_settings: Any = None, **_kw: Any) -> dict:
+        def _do():
+            ok, message = _set_gamefilter_ports_impl(_manager_dir(), mode, ports, reset is True, expected_mode, expected_settings)
+            state = _collect_state()
+            state.update(gamefilter_ok=ok, gamefilter_message=message)
+            return state
         return await asyncio.to_thread(_do)
 
     async def set_gamefilter_protocol_mode(
